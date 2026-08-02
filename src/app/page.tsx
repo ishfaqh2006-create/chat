@@ -311,7 +311,7 @@ export default function SZChatApp() {
     };
 
     fetchConversation();
-    const interval = setInterval(fetchConversation, 800);
+    const interval = setInterval(fetchConversation, 450);
     return () => clearInterval(interval);
   }, [currentUser, activeContact]);
 
@@ -814,9 +814,6 @@ export default function SZChatApp() {
             <div className="profile-info">
               <span className="profile-name">{currentUser.fullName}</span>
               <span className="profile-username">@{currentUser.username}</span>
-              <span className={`db-status-badge ${dbProvider.includes('MongoDB') ? 'mongo' : 'local'}`}>
-                {dbProvider.includes('MongoDB') ? '🟢 MongoDB Atlas' : '🟡 JSON DB'}
-              </span>
             </div>
           </div>
 
