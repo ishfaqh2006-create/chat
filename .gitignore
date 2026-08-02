@@ -41,3 +41,9 @@ yarn-error.log*
 next-env.d.ts
 
 .vercel
+
+# Secret credential files
+atlas-credentials.env
+
+# Local JSON database (not needed on Vercel/MongoDB)
+data/db.json
