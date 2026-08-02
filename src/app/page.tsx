@@ -74,6 +74,11 @@ export default function SZChatApp() {
   const [isPeerTyping, setIsPeerTyping] = useState(false);
   const [dbProvider, setDbProvider] = useState<string>('MongoDB Atlas');
 
+  // WebRTC PeerJS State
+  const [peer, setPeer] = useState<any>(null);
+  const [peerStatus, setPeerStatus] = useState<'offline' | 'connecting' | 'connected'>('offline');
+  const connectionsRef = useRef<Record<string, any>>({});
+
   // Disappearing & Media State
   const [disappearingOption, setDisappearingOption] = useState<DisappearingOption>('off');
   const [showDisappearingMenu, setShowDisappearingMenu] = useState(false);
@@ -140,6 +145,13 @@ export default function SZChatApp() {
         localStorage.removeItem('szchat_user_session');
       }
     }
+
+    // Request Notification permission
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      if (Notification.permission === 'default') {
+        Notification.requestPermission();
+      }
+    }
   }, []);
 
   // 2. Browser & Native Phone Hardware Back Button (popstate) Navigation
@@ -171,6 +183,33 @@ export default function SZChatApp() {
     setShowMobileChat(false);
     setActiveContact(null);
   };
+
+  // Load conversation from localStorage when active contact changes
+  useEffect(() => {
+    if (!currentUser || !activeContact) {
+      setMessages([]);
+      return;
+    }
+    const localKey = `szchat_msgs_${currentUser.id}_${activeContact.id}`;
+    const saved = localStorage.getItem(localKey);
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        setMessages(parsed);
+
+        // Populate decrypted texts mapping
+        const newDecrypted: Record<string, string> = {};
+        parsed.forEach((m: MessageItem) => {
+          if (m.text) newDecrypted[m.id] = m.text;
+        });
+        setDecryptedTexts(prev => ({ ...prev, ...newDecrypted }));
+      } catch (_) {
+        setMessages([]);
+      }
+    } else {
+      setMessages([]);
+    }
+  }, [currentUser, activeContact]);
 
   // 3. Auth Handlers
   const handleAuthSubmit = async (e: React.FormEvent) => {
@@ -247,73 +286,159 @@ export default function SZChatApp() {
     return () => clearInterval(interval);
   }, [currentUser]);
 
-  // 5. Poll Messages — 800ms for near-real-time feel; only decrypt NEW messages
-  useEffect(() => {
-    if (!currentUser || !activeContact) return;
-
-    // Reset decryption cache when conversation changes
-    decryptedIdsRef.current = new Set();
-
-    const fetchConversation = async () => {
+  // Local Notification Helper
+  const showLocalNotification = (senderName: string, text: string) => {
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
       try {
-        const msgRes = await fetch(`/api/messages?userId=${currentUser.id}&peerId=${activeContact.id}`);
-        if (msgRes.ok) {
-          const msgData = await msgRes.json();
-          const rawMsgs: MessageItem[] = msgData.messages || [];
-
-          // Diff by last message id + count to avoid full stringify
-          const prevLast = messagesRef.current[messagesRef.current.length - 1]?.id;
-          const newLast = rawMsgs[rawMsgs.length - 1]?.id;
-          const prevCount = messagesRef.current.filter(m => !m.isOptimistic).length;
-
-          if (prevLast !== newLast || prevCount !== rawMsgs.length) {
-            // Replace optimistic messages with server-confirmed ones
-            setMessages(rawMsgs);
-
-            // Only decrypt messages we haven't seen yet
-            const key = await getSymmetricKeyForPair(currentUser.id, activeContact.id);
-            const newDecrypted: Record<string, string> = {};
-            let hasNew = false;
-
-            for (const m of rawMsgs) {
-              if (!decryptedIdsRef.current.has(m.id)) {
-                hasNew = true;
-                decryptedIdsRef.current.add(m.id);
-                if (m.ciphertext && m.iv) {
-                  try {
-                    newDecrypted[m.id] = await decryptE2EE(key, m.ciphertext, m.iv);
-                  } catch {
-                    newDecrypted[m.id] = m.text || '[Encrypted]';
-                  }
-                } else if (m.text) {
-                  newDecrypted[m.id] = m.text;
-                }
-              }
-            }
-            if (hasNew) setDecryptedTexts(prev => ({ ...prev, ...newDecrypted }));
-          } else {
-            // Same messages — only update status ticks (no re-render of bubbles)
-            const prevStatuses = messagesRef.current.map(m => m.status).join();
-            const newStatuses = rawMsgs.map((m: MessageItem) => m.status).join();
-            if (prevStatuses !== newStatuses) {
-              setMessages(rawMsgs);
-            }
-          }
-        }
-
-        // Fetch typing separately — it's cheap
-        const typeRes = await fetch(`/api/typing?userId=${currentUser.id}&peerId=${activeContact.id}`);
-        if (typeRes.ok) {
-          const typeData = await typeRes.json();
-          setIsPeerTyping(typeData.isTyping);
-        }
+        new Notification(`New message from ${senderName}`, {
+          body: text,
+          icon: '/icon.svg',
+        });
       } catch (_) {}
-    };
+    }
+  };
 
-    fetchConversation();
-    const interval = setInterval(fetchConversation, 450);
-    return () => clearInterval(interval);
-  }, [currentUser, activeContact]);
+  // Setup PeerJS connection listeners
+  const setupConnectionListeners = (conn: any) => {
+    conn.on('data', async (data: any) => {
+      if (data && data.type === 'message') {
+        const msg = data.message;
+        let plainText = '';
+
+        if (msg.ciphertext && msg.iv) {
+          try {
+            const aesKey = await getSymmetricKeyForPair(currentUser?.id || '', msg.senderId);
+            plainText = await decryptE2EE(aesKey, msg.ciphertext, msg.iv);
+          } catch {
+            plainText = '[Encrypted Message]';
+          }
+        } else if (msg.text) {
+          plainText = msg.text;
+        }
+
+        const resolvedMsg = {
+          ...msg,
+          text: plainText,
+          ciphertext: undefined,
+          iv: undefined,
+        };
+
+        // Save incoming message to state & localStorage
+        setMessages(prev => {
+          const isMsgForActiveChat = activeContact && activeContact.id === msg.senderId;
+          const targetContactId = msg.senderId;
+          const localKey = `szchat_msgs_${currentUser?.id}_${targetContactId}`;
+
+          let updated: MessageItem[] = [];
+          const saved = localStorage.getItem(localKey);
+          if (saved) {
+            try { updated = JSON.parse(saved); } catch (_) {}
+          }
+          if (!updated.some(m => m.id === resolvedMsg.id)) {
+            updated.push(resolvedMsg);
+            localStorage.setItem(localKey, JSON.stringify(updated));
+          }
+
+          // Trigger local notification if tab is unfocused or different chat is open
+          const isTabHidden = typeof document !== 'undefined' && document.hidden;
+          if (isTabHidden || !isMsgForActiveChat) {
+            const senderContact = contactsRef.current.find(c => c.id === msg.senderId);
+            const senderName = senderContact ? senderContact.fullName : 'Someone';
+            const displayBody = msg.fileType === 'image' ? '📷 Photo' : msg.fileType === 'audio' ? '🎤 Voice Note' : plainText;
+            showLocalNotification(senderName, displayBody);
+          }
+
+          return isMsgForActiveChat ? updated : prev;
+        });
+
+        setDecryptedTexts(prev => ({ ...prev, [resolvedMsg.id]: plainText }));
+      }
+    });
+
+    conn.on('close', () => {
+      if (activeContact && conn.peer === activeContact.id) {
+        setPeerStatus('offline');
+      }
+      delete connectionsRef.current[conn.peer];
+    });
+
+    conn.on('error', () => {
+      if (activeContact && conn.peer === activeContact.id) {
+        setPeerStatus('offline');
+      }
+      delete connectionsRef.current[conn.peer];
+    });
+  };
+
+  // 5. Initialize PeerJS client-side
+  useEffect(() => {
+    if (typeof window === 'undefined' || !currentUser) return;
+
+    let peerInstance: any;
+
+    import('peerjs').then(({ default: Peer }) => {
+      peerInstance = new Peer(currentUser.id, {
+        debug: 1,
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+          ]
+        }
+      });
+
+      peerInstance.on('open', () => {
+        setPeer(peerInstance);
+      });
+
+      peerInstance.on('connection', (conn: any) => {
+        connectionsRef.current[conn.peer] = conn;
+        setupConnectionListeners(conn);
+      });
+    });
+
+    return () => {
+      if (peerInstance) {
+        peerInstance.destroy();
+      }
+    };
+  }, [currentUser]);
+
+  // Connect to the active contact's peer
+  useEffect(() => {
+    if (!peer || !activeContact || !currentUser) {
+      setPeerStatus('offline');
+      return;
+    }
+
+    const existingConn = connectionsRef.current[activeContact.id];
+    if (existingConn && existingConn.open) {
+      setPeerStatus('connected');
+      return;
+    }
+
+    setPeerStatus('connecting');
+
+    const conn = peer.connect(activeContact.id, { reliable: true });
+
+    conn.on('open', () => {
+      setPeerStatus('connected');
+      connectionsRef.current[activeContact.id] = conn;
+      setupConnectionListeners(conn);
+    });
+
+    conn.on('error', () => {
+      setPeerStatus('offline');
+    });
+
+    const timeout = setTimeout(() => {
+      if (!connectionsRef.current[activeContact.id]?.open) {
+        setPeerStatus('offline');
+      }
+    }, 4000);
+
+    return () => clearTimeout(timeout);
+  }, [peer, activeContact, currentUser]);
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -352,7 +477,7 @@ export default function SZChatApp() {
     }
   };
 
-  // 7. Send Message — OPTIMISTIC UI (instant) + reply support
+  // 7. Send Message — Direct Browser-to-Browser via WebRTC
   const handleSendMessage = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!inputText.trim() || !currentUser || !activeContact) return;
@@ -360,67 +485,59 @@ export default function SZChatApp() {
     const textToSend = inputText.trim();
     const currentReplyTo = replyTo;
 
-    // Clear input & reply bar immediately (feels instant)
+    // Check connection first
+    const conn = connectionsRef.current[activeContact.id];
+    if (!conn || !conn.open) {
+      alert(`@${activeContact.username} is currently offline. P2P messages can only be sent when both users are online!`);
+      return;
+    }
+
+    // Clear input & reply bar immediately
     setInputText('');
     setReplyTo(null);
     setShowEmojiPicker(false);
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
 
-    // ── OPTIMISTIC: add to UI right now with a temp id ──
-    const optimisticId = 'opt_' + Date.now();
-    const optimisticMsg: MessageItem = {
-      id: optimisticId,
+    // Create unique message item
+    const msgId = 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    const newMsg: MessageItem = {
+      id: msgId,
       senderId: currentUser.id,
       receiverId: activeContact.id,
       text: textToSend,
       timestamp: Date.now(),
-      status: 'sent',
-      isOptimistic: true,
+      status: 'read', // instant peer-to-peer delivery
       replyToId: currentReplyTo?.id,
       replyToText: currentReplyTo?.text,
       replyToSender: currentReplyTo?.senderName,
     };
-    setMessages(prev => [...prev.filter(m => !m.isOptimistic || m.id !== optimisticId), optimisticMsg]);
-    setDecryptedTexts(prev => ({ ...prev, [optimisticId]: textToSend }));
 
-    fetch('/api/typing', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUser.id, typingTo: null }),
-    }).catch(() => {});
+    // Save to our own state & localStorage
+    setMessages(prev => {
+      const localKey = `szchat_msgs_${currentUser.id}_${activeContact.id}`;
+      const updated = [...prev.filter(m => m.id !== msgId), newMsg];
+      localStorage.setItem(localKey, JSON.stringify(updated));
+      return updated;
+    });
+    setDecryptedTexts(prev => ({ ...prev, [msgId]: textToSend }));
 
+    // Send encrypted over peer connection
     try {
       const aesKey = await getSymmetricKeyForPair(currentUser.id, activeContact.id);
       const { ciphertext, iv } = await encryptE2EE(aesKey, textToSend);
 
-      const res = await fetch('/api/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          senderId: currentUser.id,
-          receiverId: activeContact.id,
+      conn.send({
+        type: 'message',
+        message: {
+          ...newMsg,
           ciphertext,
           iv,
-          disappearingOption,
-          viewOnce: disappearingOption === 'view_once',
-          replyToId: currentReplyTo?.id,
-          replyToText: currentReplyTo?.text,
-          replyToSender: currentReplyTo?.senderName,
-        }),
+          text: undefined, // remove raw text from wire
+          encrypted: true,
+        }
       });
-
-      if (res.ok) {
-        const data = await res.json();
-        // Replace optimistic message with server-confirmed one
-        setMessages(prev => prev.map(m => m.id === optimisticId ? { ...data.message } : m));
-        setDecryptedTexts(prev => ({ ...prev, [data.message.id]: textToSend }));
-        decryptedIdsRef.current.add(data.message.id);
-      } else {
-        // Remove failed optimistic message
-        setMessages(prev => prev.filter(m => m.id !== optimisticId));
-      }
-    } catch {
-      setMessages(prev => prev.filter(m => m.id !== optimisticId));
+    } catch (err) {
+      console.error('P2P Message Encryption/Transmission error:', err);
     }
   };
 
@@ -1077,7 +1194,7 @@ export default function SZChatApp() {
                     <span style={{ fontSize: '11px', color: 'var(--wa-primary)', fontWeight: '600' }}>🔒 E2EE</span>
                   </div>
                   <span className={`chat-status ${isPeerTyping ? 'typing' : ''}`}>
-                    {isPeerTyping ? 'typing...' : (activeContact.isOnline ? 'online' : 'offline')}
+                    {isPeerTyping ? 'typing...' : peerStatus}
                   </span>
                 </div>
               </div>
