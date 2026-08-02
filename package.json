@@ -1,5 +1,5 @@
 {
-  "name": "ipchat",
+  "name": "szchat",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "mongoose": "^9.9.1",
     "next": "16.2.12",
     "peerjs": "^1.5.5",
     "react": "19.2.4",

@@ -1,125 +1,377 @@
 "use client";
 
-import { useState, useEffect, useRef } from 'react';
-import Peer, { DataConnection } from 'peerjs';
+import { useState, useEffect } from 'react';
+import Link from 'next/link';
 
-type LogEntry = {
+type UserRecordWithPassword = {
   id: string;
-  timestamp: string;
-  roomId: string;
-  action: string;
-  role: string;
+  username: string;
+  fullName: string;
+  password?: string;
+  avatarColor: string;
+  createdAt: string;
+  lastSeen: number;
 };
 
-export default function AdminPanel() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [name, setName] = useState('');
-  const [password, setPassword] = useState('');
-  const [dob, setDob] = useState('');
-  
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const peerInstance = useRef<Peer | null>(null);
+type AppStats = {
+  totalUsers: number;
+  maxUsers: number;
+  totalMessages: number;
+};
 
-  const handleLogin = (e: React.FormEvent) => {
+export default function AdminPage() {
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
+  const [adminName, setAdminName] = useState('Ishfaq');
+  const [adminPassword, setAdminPassword] = useState('Ishfaq@11');
+  const [showAdminPassword, setShowAdminPassword] = useState(false);
+  const [loginError, setLoginError] = useState('');
+
+  // Admin Data State
+  const [users, setUsers] = useState<UserRecordWithPassword[]>([]);
+  const [stats, setStats] = useState<AppStats>({ totalUsers: 0, maxUsers: 20, totalMessages: 0 });
+  const [newMaxUsers, setNewMaxUsers] = useState<number>(20);
+  const [showPasswords, setShowPasswords] = useState(true);
+  const [actionMessage, setActionMessage] = useState('');
+
+  // 1. Admin Login Handler
+  const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (name === 'Ishfaq' && password === 'Ishfaq@11' && dob === '6102006') {
-      setIsAuthenticated(true);
-    } else {
-      alert("Invalid Credentials");
+    setLoginError('');
+
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'login',
+          adminName,
+          adminPassword
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setLoginError(data.error || 'Invalid Admin Credentials');
+        return;
+      }
+
+      setIsAdminAuthenticated(true);
+      setUsers(data.users || []);
+      setStats(data.stats || { totalUsers: 0, maxUsers: 20, totalMessages: 0 });
+      setNewMaxUsers(data.config?.maxUsers || 20);
+    } catch (err) {
+      setLoginError('Server connection error.');
     }
   };
 
-  useEffect(() => {
-    if (!isAuthenticated) return;
-
-    // Connect to PeerJS as the Admin
-    const peer = new Peer('secure-room-admin', { debug: 2 });
-    peerInstance.current = peer;
-
-    peer.on('open', (id) => {
-      console.log('Admin connected to tracking server as:', id);
-    });
-
-    peer.on('connection', (conn: DataConnection) => {
-      conn.on('data', (data: any) => {
-        if (data && data.type === 'log') {
-          setLogs(prev => [{
-            id: Math.random().toString(36).substring(7),
-            timestamp: data.timestamp,
-            roomId: data.roomId,
-            action: data.action,
-            role: data.role
-          }, ...prev].slice(0, 100)); // keep last 100 logs
-        }
+  // 2. Refresh Admin Data
+  const refreshAdminData = async () => {
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'login',
+          adminName,
+          adminPassword
+        })
       });
-    });
 
-    return () => {
-      if (peerInstance.current) peerInstance.current.destroy();
-    };
-  }, [isAuthenticated]);
+      if (res.ok) {
+        const data = await res.json();
+        setUsers(data.users || []);
+        setStats(data.stats || { totalUsers: 0, maxUsers: 20, totalMessages: 0 });
+      }
+    } catch (err) {}
+  };
 
-  if (!isAuthenticated) {
+  useEffect(() => {
+    if (isAdminAuthenticated) {
+      const interval = setInterval(refreshAdminData, 3000);
+      return () => clearInterval(interval);
+    }
+  }, [isAdminAuthenticated, adminName, adminPassword]);
+
+  // 3. Update Max Users Setting
+  const handleUpdateMaxUsers = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setActionMessage('');
+
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'updateMaxUsers',
+          adminName,
+          adminPassword,
+          maxUsers: newMaxUsers
+        })
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        setActionMessage(`Success: ${data.message}`);
+        setStats(prev => ({ ...prev, maxUsers: newMaxUsers }));
+      } else {
+        setActionMessage(`Error: ${data.error}`);
+      }
+    } catch (err) {
+      setActionMessage('Failed to update max users setting.');
+    }
+  };
+
+  // 4. Delete User Account
+  const handleDeleteUser = async (userId: string, username: string) => {
+    if (!confirm(`Are you sure you want to delete user @${username}?`)) return;
+
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'deleteUser',
+          adminName,
+          adminPassword,
+          targetUserId: userId
+        })
+      });
+
+      if (res.ok) {
+        setUsers(prev => prev.filter(u => u.id !== userId));
+        setActionMessage(`Deleted user @${username}`);
+        refreshAdminData();
+      }
+    } catch (err) {}
+  };
+
+  // 5. Clear All Messages
+  const handleClearAllMessages = async () => {
+    if (!confirm('Are you sure you want to clear ALL chat history?')) return;
+
+    try {
+      const res = await fetch('/api/admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'clearMessages',
+          adminName,
+          adminPassword
+        })
+      });
+
+      if (res.ok) {
+        setActionMessage('All chat history cleared');
+        refreshAdminData();
+      }
+    } catch (err) {}
+  };
+
+  // Login View
+  if (!isAdminAuthenticated) {
     return (
-      <main className="container flex-center" style={{ flex: 1 }}>
-        <form onSubmit={handleLogin} className="glass-panel animate-fade-in" style={{ maxWidth: '400px', width: '100%' }}>
-          <h1 className="text-center" style={{ color: 'var(--danger)' }}>ADMIN ACCESS</h1>
-          
-          <div className="input-group">
-            <label>Name</label>
-            <input type="text" required className="input" value={name} onChange={e => setName(e.target.value)} />
-          </div>
-          
-          <div className="input-group">
-            <label>Password</label>
-            <input type="password" required className="input" value={password} onChange={e => setPassword(e.target.value)} />
-          </div>
-          
-          <div className="input-group">
-            <label>DOB (DDMMYYYY)</label>
-            <input type="text" required className="input" value={dob} onChange={e => setDob(e.target.value)} />
+      <div className="auth-overlay" suppressHydrationWarning>
+        <div className="auth-card" suppressHydrationWarning>
+          <div className="auth-header">
+            <svg viewBox="0 0 24 24" width="48" height="48" fill="var(--wa-danger)">
+              <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8s0 0 0 0z"/>
+            </svg>
+            <h1 className="auth-title" style={{ color: 'var(--wa-danger)' }}>Admin Portal</h1>
+            <p className="auth-subtitle">Login to manage users, passwords & max limit settings</p>
           </div>
 
-          <button type="submit" className="btn" style={{ width: '100%', marginTop: '1rem', background: 'var(--danger)' }}>
-            LOGIN
-          </button>
-        </form>
-      </main>
+          {loginError && <div className="error-banner">{loginError}</div>}
+
+          <form onSubmit={handleAdminLogin} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }} suppressHydrationWarning>
+            <div className="form-group" suppressHydrationWarning>
+              <label className="form-label">Admin Name</label>
+              <input 
+                type="text" 
+                required 
+                className="form-input" 
+                value={adminName} 
+                onChange={e => setAdminName(e.target.value)} 
+                suppressHydrationWarning
+              />
+            </div>
+
+            <div className="form-group" suppressHydrationWarning>
+              <label className="form-label">Admin Password</label>
+              <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                <input 
+                  type={showAdminPassword ? "text" : "password"} 
+                  required 
+                  className="form-input" 
+                  style={{ width: '100%', paddingRight: '42px' }}
+                  value={adminPassword} 
+                  onChange={e => setAdminPassword(e.target.value)} 
+                  suppressHydrationWarning
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowAdminPassword(!showAdminPassword)}
+                  style={{
+                    position: 'absolute', right: '10px', background: 'transparent',
+                    border: 'none', color: 'var(--wa-text-secondary)', cursor: 'pointer', fontSize: '16px'
+                  }}
+                  title={showAdminPassword ? "Hide password" : "Show password"}
+                >
+                  {showAdminPassword ? "🙈" : "👁️"}
+                </button>
+              </div>
+            </div>
+
+            <button type="submit" className="btn-primary" style={{ background: 'var(--wa-danger)', marginTop: '8px' }} suppressHydrationWarning>
+              ACCESS ADMIN DASHBOARD
+            </button>
+          </form>
+
+          <div style={{ textAlign: 'center', marginTop: '10px' }}>
+            <Link href="/" style={{ color: 'var(--wa-text-secondary)', fontSize: '13px' }}>
+              ← Return to szchat
+            </Link>
+          </div>
+        </div>
+      </div>
     );
   }
 
+  // Authenticated Admin Dashboard
   return (
-    <main className="container animate-fade-in">
-      <div className="glass-panel">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem' }}>
-          <h1 style={{ color: 'var(--danger)' }}>LIVE ACTIVITY MONITOR</h1>
-          <span className="badge" style={{ background: 'var(--danger)' }}>E2EE PROTECTED - METADATA ONLY</span>
+    <div className="admin-container">
+      {/* Header */}
+      <div className="admin-header">
+        <div>
+          <h1 style={{ fontSize: '24px', fontWeight: '700', color: 'var(--wa-primary)' }}>szchat Admin Portal</h1>
+          <p style={{ color: 'var(--wa-text-secondary)', fontSize: '13px', marginTop: '4px' }}>
+            Registered Users, Passwords & System Configurations
+          </p>
+        </div>
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+          <Link href="/" className="btn-primary" style={{ textDecoration: 'none', padding: '8px 16px', fontSize: '13px' }}>
+            Open szchat App
+          </Link>
+          <button className="btn-primary" style={{ background: 'var(--wa-header-dark)', color: '#fff', padding: '8px 16px', fontSize: '13px' }} onClick={() => setIsAdminAuthenticated(false)}>
+            Exit Admin
+          </button>
+        </div>
+      </div>
+
+      {actionMessage && (
+        <div className="error-banner" style={{ background: 'rgba(0, 168, 132, 0.15)', borderColor: 'var(--wa-primary)', color: 'var(--wa-primary)', marginBottom: '20px' }}>
+          {actionMessage}
+        </div>
+      )}
+
+      {/* Metrics Row */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginBottom: '24px' }}>
+        <div className="admin-card" style={{ marginBottom: 0 }}>
+          <span style={{ color: 'var(--wa-text-secondary)', fontSize: '12px', fontWeight: '600' }}>TOTAL USERS</span>
+          <h2 style={{ fontSize: '32px', fontWeight: '700', color: 'var(--wa-primary)', marginTop: '4px' }}>{stats.totalUsers}</h2>
+        </div>
+        <div className="admin-card" style={{ marginBottom: 0 }}>
+          <span style={{ color: 'var(--wa-text-secondary)', fontSize: '12px', fontWeight: '600' }}>MAX USERS LIMIT</span>
+          <h2 style={{ fontSize: '32px', fontWeight: '700', color: 'var(--wa-accent-yellow)', marginTop: '4px' }}>{stats.maxUsers}</h2>
+        </div>
+        <div className="admin-card" style={{ marginBottom: 0 }}>
+          <span style={{ color: 'var(--wa-text-secondary)', fontSize: '12px', fontWeight: '600' }}>TOTAL MESSAGES SENT</span>
+          <h2 style={{ fontSize: '32px', fontWeight: '700', color: 'var(--wa-tick-blue)', marginTop: '4px' }}>{stats.totalMessages}</h2>
+        </div>
+      </div>
+
+      {/* Max Users Configuration Card */}
+      <div className="admin-card">
+        <h3 style={{ fontSize: '16px', fontWeight: '600', marginBottom: '12px' }}>⚙️ Manage Max Users Limit</h3>
+        <p style={{ color: 'var(--wa-text-secondary)', fontSize: '13px', marginBottom: '16px' }}>
+          Decide the maximum number of users allowed to sign up. When this limit is reached, new user registrations will be automatically blocked.
+        </p>
+
+        <form onSubmit={handleUpdateMaxUsers} style={{ display: 'flex', gap: '12px', maxWidth: '400px' }}>
+          <input 
+            type="number" 
+            min="1" 
+            max="1000" 
+            className="form-input" 
+            style={{ flex: 1 }} 
+            value={newMaxUsers} 
+            onChange={e => setNewMaxUsers(parseInt(e.target.value, 10) || 1)}
+          />
+          <button type="submit" className="btn-primary" style={{ padding: '10px 20px', fontSize: '14px' }}>
+            Save Max Limit
+          </button>
+        </form>
+      </div>
+
+      {/* User Records Table */}
+      <div className="admin-card">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+          <h3 style={{ fontSize: '16px', fontWeight: '600' }}>👥 All Registered Users & Passwords</h3>
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <button 
+              className="badge-tag" 
+              style={{ cursor: 'pointer', background: showPasswords ? 'var(--wa-primary)' : 'var(--wa-header-dark)', color: showPasswords ? '#000' : '#fff' }}
+              onClick={() => setShowPasswords(!showPasswords)}
+            >
+              {showPasswords ? 'Hide Passwords' : 'Show Passwords'}
+            </button>
+            <button className="badge-tag" style={{ cursor: 'pointer', background: 'var(--wa-danger)', color: '#fff' }} onClick={handleClearAllMessages}>
+              Clear Chat History
+            </button>
+          </div>
         </div>
 
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse' }}>
+        <div className="table-responsive">
+          <table className="admin-table">
             <thead>
-              <tr style={{ borderBottom: '1px solid var(--panel-border)', color: 'var(--danger)' }}>
-                <th style={{ padding: '1rem' }}>Timestamp</th>
-                <th style={{ padding: '1rem' }}>Room ID</th>
-                <th style={{ padding: '1rem' }}>Role</th>
-                <th style={{ padding: '1rem' }}>Action Event</th>
+              <tr>
+                <th>User Avatar</th>
+                <th>Full Name</th>
+                <th>Username</th>
+                <th>User Password</th>
+                <th>Created At</th>
+                <th>Last Active</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {logs.length === 0 ? (
+              {users.length === 0 ? (
                 <tr>
-                  <td colSpan={4} style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-muted)' }}>
-                    Listening for live network activity...
+                  <td colSpan={7} style={{ textAlign: 'center', padding: '32px', color: 'var(--wa-text-muted)' }}>
+                    No users registered yet. Users will appear here after sign up.
                   </td>
                 </tr>
               ) : (
-                logs.map(log => (
-                  <tr key={log.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
-                    <td style={{ padding: '1rem', color: 'var(--text-muted)' }}>{new Date(log.timestamp).toLocaleTimeString()}</td>
-                    <td style={{ padding: '1rem', fontFamily: 'monospace' }}>{log.roomId}</td>
-                    <td style={{ padding: '1rem' }}>{log.role}</td>
-                    <td style={{ padding: '1rem', color: 'var(--primary)' }}>{log.action}</td>
+                users.map(u => (
+                  <tr key={u.id}>
+                    <td>
+                      <div className="avatar sm" style={{ backgroundColor: u.avatarColor }}>
+                        {u.fullName.charAt(0)}
+                      </div>
+                    </td>
+                    <td style={{ fontWeight: '600' }}>{u.fullName}</td>
+                    <td style={{ color: 'var(--wa-primary)' }}>@{u.username}</td>
+                    <td>
+                      <span className="badge-tag" style={{ color: 'var(--wa-accent-yellow)' }}>
+                        {showPasswords ? u.password : '••••••••'}
+                      </span>
+                    </td>
+                    <td style={{ color: 'var(--wa-text-muted)', fontSize: '12px' }}>
+                      {new Date(u.createdAt).toLocaleDateString()}
+                    </td>
+                    <td style={{ color: 'var(--wa-text-muted)', fontSize: '12px' }}>
+                      {new Date(u.lastSeen).toLocaleTimeString()}
+                    </td>
+                    <td>
+                      <button 
+                        style={{
+                          background: 'rgba(234, 67, 53, 0.2)', border: '1px solid var(--wa-danger)', 
+                          color: '#ff8f8f', padding: '4px 10px', borderRadius: '6px', cursor: 'pointer', fontSize: '12px'
+                        }}
+                        onClick={() => handleDeleteUser(u.id, u.username)}
+                      >
+                        Delete
+                      </button>
+                    </td>
                   </tr>
                 ))
               )}
@@ -127,6 +379,6 @@ export default function AdminPanel() {
           </table>
         </div>
       </div>
-    </main>
+    </div>
   );
 }

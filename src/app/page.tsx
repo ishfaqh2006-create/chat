@@ -1,323 +1,1287 @@
 "use client";
 
-import { useState, useRef, useEffect } from 'react';
-import { 
-  generateKeyPair, exportPublicKey, importPublicKey, deriveSharedKey, 
-  generateSecurityFingerprint, encryptData, decryptData 
-} from '@/lib/crypto';
-import { useWebRTC } from '@/hooks/useWebRTC';
+import { useState, useEffect, useRef } from 'react';
+import Link from 'next/link';
+import { DisappearingOption } from '@/lib/db';
+import { getSymmetricKeyForPair, encryptE2EE, decryptE2EE } from '@/lib/crypto';
 
-type Message = {
+type UserProfile = {
   id: string;
-  text?: string;
-  photo?: string;
-  sender: 'me' | 'them';
-  viewOnce?: boolean;
+  username: string;
+  fullName: string;
+  avatarColor: string;
+  createdAt: string;
+  lastSeen: number;
+  statusMessage?: string;
+  isOnline?: boolean;
+  lastMessage?: MessageItem;
+  unreadCount?: number;
 };
 
-export default function App() {
-  const [username, setUsername] = useState('');
-  const [passkey, setPasskey] = useState('');
-  const [role, setRole] = useState<'initiator' | 'joiner' | null>(null);
-  
-  const [myKeyPair, setMyKeyPair] = useState<CryptoKeyPair | null>(null);
-  const [sharedAesKey, setSharedAesKey] = useState<CryptoKey | null>(null);
-  const [fingerprint, setFingerprint] = useState<string>('');
-  
-  const [roomId, setRoomId] = useState<string>('');
+type MessageItem = {
+  id: string;
+  senderId: string;
+  receiverId: string;
+  text?: string;
+  fileUrl?: string;
+  fileType?: 'image' | 'audio' | 'document';
+  ciphertext?: string;
+  iv?: string;
+  encrypted?: boolean;
+  timestamp: number;
+  status: 'sent' | 'delivered' | 'read';
+  viewOnce?: boolean;
+  viewOnceOpened?: boolean;
+  disappearingOption?: DisappearingOption;
+  expiresAt?: number;
+  deletedFor?: string[];
+};
+
+const POPULAR_EMOJIS = ['😊', '😂', '😍', '👍', '❤️', '🔥', '🎉', '🙏', '👏', '💯', '🚀', '✨', '😎', '🤣', '😭', '🙌', '🤝', '🥳'];
+
+const DISAPPEARING_LABELS: Record<DisappearingOption, string> = {
+  off: 'Off',
+  view_once: 'View Once',
+  '1h': '1 Hour',
+  '24h': '24 Hours',
+  '7d': '7 Days'
+};
+
+export default function SZChatApp() {
+  // Auth State
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [authUsername, setAuthUsername] = useState('');
+  const [authFullName, setAuthFullName] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [showAuthPassword, setShowAuthPassword] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+
+  // App & Database Provider State
+  const [contacts, setContacts] = useState<UserProfile[]>([]);
+  const [activeContact, setActiveContact] = useState<UserProfile | null>(null);
+  const [messages, setMessages] = useState<MessageItem[]>([]);
+  const [decryptedTexts, setDecryptedTexts] = useState<Record<string, string>>({});
   const [inputText, setInputText] = useState('');
-  const [chatMessages, setChatMessages] = useState<Message[]>([]);
-  
-  const [viewOnceMode, setViewOnceMode] = useState(false);
-  const [cameraActive, setCameraActive] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isPeerTyping, setIsPeerTyping] = useState(false);
+  const [dbProvider, setDbProvider] = useState<string>('MongoDB Atlas');
+
+  // Disappearing & Media State
+  const [disappearingOption, setDisappearingOption] = useState<DisappearingOption>('off');
+  const [showDisappearingMenu, setShowDisappearingMenu] = useState(false);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [showCamera, setShowCamera] = useState(false);
+
+  // Add Contact Modal State
+  const [showAddContactModal, setShowAddContactModal] = useState(false);
+  const [contactSearchInput, setContactSearchInput] = useState('');
+  const [contactSearchResults, setContactSearchResults] = useState<(UserProfile & { isAdded?: boolean })[]>([]);
+  const [addContactMessage, setAddContactMessage] = useState('');
+
+  // Settings Drawer State
+  const [showSettingsDrawer, setShowSettingsDrawer] = useState(false);
+  const [editFullName, setEditFullName] = useState('');
+  const [editStatusMessage, setEditStatusMessage] = useState('');
+  const [profileSaveMessage, setProfileSaveMessage] = useState('');
+
+  // Selected Message Menu State
+  const [selectedMessageMenuId, setSelectedMessageMenuId] = useState<string | null>(null);
+
+  // Mobile View & Hydration Guard
+  const [showMobileChat, setShowMobileChat] = useState(false);
+  const [isMounted, setIsMounted] = useState(false);
+
+  // Refs for State Diffing & Scroll Lock
+  const contactsRef = useRef<UserProfile[]>([]);
+  const messagesRef = useRef<MessageItem[]>([]);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
-  const chatBottomRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const { 
-    status, setStatus, messages: encryptedMessages, sendMessage, 
-    theirPublicKey, sendPublicKey, theirUsername, approveConnection, rejectConnection
-  } = useWebRTC(roomId, role === 'initiator', username);
+  // Keep refs in sync with state for diffing
+  useEffect(() => { contactsRef.current = contacts; }, [contacts]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
 
-  const handleConnect = async (selectedRole: 'initiator' | 'joiner') => {
-    if (!username.trim()) {
-      alert("Please enter a username.");
-      return;
-    }
-    if (!passkey || passkey.length < 4) {
-      alert("Passkey must be at least 4 characters.");
-      return;
-    }
-    
-    const enc = new TextEncoder();
-    const hashBuffer = await crypto.subtle.digest('SHA-256', enc.encode(passkey));
-    const hashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-    
-    const keyPair = await generateKeyPair();
-    setMyKeyPair(keyPair);
-    setRoomId(hashHex.substring(0, 16));
-    setRole(selectedRole);
-  };
-
+  // 1. Restore Session & Hydration Check
   useEffect(() => {
-    if (status === 'connected' && myKeyPair) {
-      exportPublicKey(myKeyPair.publicKey).then(sendPublicKey);
-    }
-  }, [status, myKeyPair]);
-
-  useEffect(() => {
-    const establishSecureConnection = async () => {
-      if (theirPublicKey && myKeyPair) {
-        const importedTheirKey = await importPublicKey(theirPublicKey);
-        const derivedKey = await deriveSharedKey(myKeyPair.privateKey, importedTheirKey);
-        setSharedAesKey(derivedKey);
-        
-        const myJwk = await exportPublicKey(myKeyPair.publicKey);
-        const fp = await generateSecurityFingerprint(myJwk, theirPublicKey);
-        setFingerprint(fp);
-        
-        setStatus('securely-connected');
-      }
-    };
-    establishSecureConnection();
-  }, [theirPublicKey, myKeyPair]);
-
-  useEffect(() => {
-    const processIncoming = async () => {
-      if (!sharedAesKey || encryptedMessages.length === 0) return;
-      
-      const latestMsg = encryptedMessages[encryptedMessages.length - 1];
-      if (latestMsg.sender === 'them' && latestMsg.ciphertext && latestMsg.iv) {
-        try {
-          const decrypted = await decryptData(sharedAesKey, latestMsg.ciphertext, latestMsg.iv);
-          setChatMessages(prev => [...prev, {
-            id: latestMsg.id,
-            text: latestMsg.type === 'text' ? decrypted : undefined,
-            photo: latestMsg.type === 'photo' ? decrypted : undefined,
-            sender: 'them',
-            viewOnce: latestMsg.viewOnce
-          }]);
-        } catch (e) {
-          console.error("Decryption failed");
+    setIsMounted(true);
+    const saved = localStorage.getItem('szchat_user_session');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed && parsed.id) {
+          setCurrentUser(parsed);
+          setEditFullName(parsed.fullName || '');
+          setEditStatusMessage(parsed.statusMessage || 'Hey there! I am using szchat.');
         }
+      } catch (e) {
+        localStorage.removeItem('szchat_user_session');
+      }
+    }
+  }, []);
+
+  // 2. Browser & Native Phone Hardware Back Button (popstate) Navigation
+  useEffect(() => {
+    const handlePopState = () => {
+      if (showMobileChat || activeContact) {
+        setShowMobileChat(false);
+        setActiveContact(null);
+      } else if (showSettingsDrawer) {
+        setShowSettingsDrawer(false);
+      } else if (showAddContactModal) {
+        setShowAddContactModal(false);
       }
     };
-    processIncoming();
-  }, [encryptedMessages, sharedAesKey]);
 
-  useEffect(() => {
-    chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages]);
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [showMobileChat, activeContact, showSettingsDrawer, showAddContactModal]);
 
-  const handleSendText = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputText.trim() || !sharedAesKey || status !== 'securely-connected') return;
-
-    const textToSend = inputText;
-    setInputText('');
-
-    const { ciphertext, iv } = await encryptData(sharedAesKey, textToSend);
-    const msgId = Math.random().toString(36).substr(2, 9);
-    
-    sendMessage({ type: 'text', ciphertext, iv, id: msgId });
-    setChatMessages(prev => [...prev, { id: msgId, text: textToSend, sender: 'me' }]);
+  const selectContactWithHistory = (contact: UserProfile) => {
+    setActiveContact(contact);
+    setShowMobileChat(true);
+    if (typeof window !== 'undefined') {
+      window.history.pushState({ chatOpen: true }, '');
+    }
   };
 
-  const handleFilePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const closeMobileChatWithHistory = () => {
+    setShowMobileChat(false);
+    setActiveContact(null);
+  };
+
+  // 3. Auth Handlers
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthLoading(true);
+
+    const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/signup';
+    const payload = authMode === 'login' 
+      ? { username: authUsername, password: authPassword }
+      : { username: authUsername, fullName: authFullName, password: authPassword };
+
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || 'Authentication failed');
+        setAuthLoading(false);
+        return;
+      }
+
+      setCurrentUser(data.user);
+      setEditFullName(data.user.fullName || '');
+      setEditStatusMessage(data.user.statusMessage || 'Hey there! I am using szchat.');
+      localStorage.setItem('szchat_user_session', JSON.stringify(data.user));
+      setAuthUsername('');
+      setAuthPassword('');
+      setAuthFullName('');
+    } catch (err) {
+      setAuthError('Connection error. Please try again.');
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('szchat_user_session');
+    setCurrentUser(null);
+    setActiveContact(null);
+    setMessages([]);
+    setShowMobileChat(false);
+  };
+
+  // 4. Real-time Contacts Polling with Data Diffing (Stops Blinking)
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const fetchContacts = async () => {
+      try {
+        const res = await fetch(`/api/users?userId=${currentUser.id}`);
+        if (res.ok) {
+          const data = await res.json();
+          const newContacts: UserProfile[] = data.users || [];
+          if (data.dbProvider) {
+            setDbProvider(data.dbProvider);
+          }
+
+          const currentStr = JSON.stringify(contactsRef.current);
+          const newStr = JSON.stringify(newContacts);
+          if (currentStr !== newStr) {
+            setContacts(newContacts);
+          }
+        }
+      } catch (err) {}
+    };
+
+    fetchContacts();
+    const interval = setInterval(fetchContacts, 2000);
+    return () => clearInterval(interval);
+  }, [currentUser]);
+
+  // 5. Poll Messages & Typing with Internal Container Scroll (Stops Page Scrolling & Interface Switching)
+  useEffect(() => {
+    if (!currentUser || !activeContact) return;
+
+    const fetchConversation = async () => {
+      try {
+        const msgRes = await fetch(`/api/messages?userId=${currentUser.id}&peerId=${activeContact.id}`);
+        if (msgRes.ok) {
+          const msgData = await msgRes.json();
+          const rawMsgs: MessageItem[] = msgData.messages || [];
+
+          const currentMsgsStr = JSON.stringify(messagesRef.current);
+          const newMsgsStr = JSON.stringify(rawMsgs);
+
+          if (currentMsgsStr !== newMsgsStr) {
+            setMessages(rawMsgs);
+
+            const key = await getSymmetricKeyForPair(currentUser.id, activeContact.id);
+            const newDecrypted: Record<string, string> = {};
+
+            for (const m of rawMsgs) {
+              if (m.ciphertext && m.iv) {
+                try {
+                  const dec = await decryptE2EE(key, m.ciphertext, m.iv);
+                  newDecrypted[m.id] = dec;
+                } catch (e) {
+                  newDecrypted[m.id] = m.text || '[Encrypted Message]';
+                }
+              } else if (m.text) {
+                newDecrypted[m.id] = m.text;
+              }
+            }
+            setDecryptedTexts(prev => ({ ...prev, ...newDecrypted }));
+          }
+        }
+
+        const typeRes = await fetch(`/api/typing?userId=${currentUser.id}&peerId=${activeContact.id}`);
+        if (typeRes.ok) {
+          const typeData = await typeRes.json();
+          setIsPeerTyping(typeData.isTyping);
+        }
+      } catch (err) {}
+    };
+
+    fetchConversation();
+    const interval = setInterval(fetchConversation, 1500);
+    return () => clearInterval(interval);
+  }, [currentUser, activeContact]);
+
+  // Lock Scroll inside Container (NEVER scroll window/page)
+  useEffect(() => {
+    if (messagesContainerRef.current) {
+      messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+    }
+  }, [messages, isPeerTyping]);
+
+  // 6. Typing Signal
+  const handleInputChange = (text: string) => {
+    setInputText(text);
+    if (!currentUser || !activeContact) return;
+
+    if (text.trim().length > 0) {
+      fetch('/api/typing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUser.id, typingTo: activeContact.id })
+      }).catch(() => {});
+    } else {
+      fetch('/api/typing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUser.id, typingTo: null })
+      }).catch(() => {});
+    }
+  };
+
+  // 7. Send E2EE Text Message (Enter & Button)
+  const handleSendMessage = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!inputText.trim() || !currentUser || !activeContact) return;
+
+    const textToSend = inputText.trim();
+    setInputText('');
+    setShowEmojiPicker(false);
+
+    fetch('/api/typing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: currentUser.id, typingTo: null })
+    }).catch(() => {});
+
+    try {
+      const aesKey = await getSymmetricKeyForPair(currentUser.id, activeContact.id);
+      const { ciphertext, iv } = await encryptE2EE(aesKey, textToSend);
+
+      const res = await fetch('/api/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          senderId: currentUser.id,
+          receiverId: activeContact.id,
+          ciphertext,
+          iv,
+          disappearingOption: disappearingOption,
+          viewOnce: disappearingOption === 'view_once'
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setMessages(prev => [...prev, data.message]);
+        setDecryptedTexts(prev => ({ ...prev, [data.message.id]: textToSend }));
+      }
+    } catch (err) {}
+  };
+
+  // 8. Image & Media Attachments
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file || !sharedAesKey || status !== 'securely-connected') return;
+    if (!file || !currentUser || !activeContact) return;
 
     const reader = new FileReader();
     reader.onload = async (event) => {
       const base64 = event.target?.result as string;
-      await encryptAndSendPhoto(base64);
+      await sendMediaMessage(base64, 'image');
     };
     reader.readAsDataURL(file);
+    e.target.value = '';
   };
 
-  const encryptAndSendPhoto = async (base64: string) => {
-    if (!sharedAesKey) return;
-    const { ciphertext, iv } = await encryptData(sharedAesKey, base64);
-    const msgId = Math.random().toString(36).substr(2, 9);
-    
-    sendMessage({ type: 'photo', ciphertext, iv, id: msgId, viewOnce: viewOnceMode });
-    setChatMessages(prev => [...prev, { id: msgId, photo: base64, sender: 'me', viewOnce: viewOnceMode }]);
-    setViewOnceMode(false);
-  };
+  const sendMediaMessage = async (fileUrl: string, fileType: 'image' | 'audio') => {
+    if (!currentUser || !activeContact) return;
 
-  const startCamera = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      const aesKey = await getSymmetricKeyForPair(currentUser.id, activeContact.id);
+      const { ciphertext, iv } = await encryptE2EE(aesKey, fileUrl);
+
+      const res = await fetch('/api/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          senderId: currentUser.id,
+          receiverId: activeContact.id,
+          fileType,
+          ciphertext,
+          iv,
+          disappearingOption: disappearingOption,
+          viewOnce: disappearingOption === 'view_once'
+        })
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setMessages(prev => [...prev, data.message]);
+        setDecryptedTexts(prev => ({ ...prev, [data.message.id]: fileUrl }));
+      }
+    } catch (err) {}
+  };
+
+  // 9. Camera Capture
+  const startCamera = async () => {
+    setShowCamera(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        setCameraActive(true);
       }
     } catch (err) {
-      alert("Camera access denied or unavailable.");
+      alert('Camera access denied or unavailable.');
+      setShowCamera(false);
     }
   };
 
-  const takePhoto = () => {
+  const capturePhoto = () => {
     if (!videoRef.current) return;
     const canvas = document.createElement('canvas');
-    canvas.width = videoRef.current.videoWidth;
-    canvas.height = videoRef.current.videoHeight;
+    canvas.width = videoRef.current.videoWidth || 640;
+    canvas.height = videoRef.current.videoHeight || 480;
     canvas.getContext('2d')?.drawImage(videoRef.current, 0, 0);
-    const base64 = canvas.toDataURL('image/jpeg', 0.8);
-    
-    const stream = videoRef.current.srcObject as MediaStream;
-    stream.getTracks().forEach(track => track.stop());
-    setCameraActive(false);
+    const base64 = canvas.toDataURL('image/jpeg', 0.85);
 
-    encryptAndSendPhoto(base64);
+    const stream = videoRef.current.srcObject as MediaStream;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    setShowCamera(false);
+
+    sendMediaMessage(base64, 'image');
   };
 
-  if (!role) {
+  // 10. Voice Recording
+  const startVoiceRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunksRef.current = [];
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const reader = new FileReader();
+        reader.onloadend = async () => {
+          const base64Audio = reader.result as string;
+          await sendMediaMessage(base64Audio, 'audio');
+        };
+        reader.readAsDataURL(audioBlob);
+
+        stream.getTracks().forEach(t => t.stop());
+      };
+
+      mediaRecorder.start();
+      setIsRecordingVoice(true);
+      setRecordingTime(0);
+
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1);
+      }, 1000);
+    } catch (err) {
+      alert('Microphone access denied or unavailable.');
+    }
+  };
+
+  const stopVoiceRecording = (send: boolean) => {
+    if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+    setIsRecordingVoice(false);
+    setRecordingTime(0);
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      if (!send) {
+        audioChunksRef.current = [];
+        mediaRecorderRef.current.onstop = null;
+      }
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  // 11. View Once Reveal
+  const handleViewOnceOpen = async (msgId: string) => {
+    try {
+      await fetch('/api/messages', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'viewOnceOpened', messageId: msgId, userId: currentUser?.id })
+      });
+      setMessages(prev => prev.map(m => m.id === msgId ? { ...m, viewOnceOpened: true } : m));
+    } catch (err) {}
+  };
+
+  // 12. Message Deletion Handlers
+  const handleDeleteMessage = async (msgId: string, actionType: 'deleteForMe' | 'deleteForEveryone') => {
+    if (!currentUser) return;
+    setSelectedMessageMenuId(null);
+
+    try {
+      const res = await fetch('/api/messages', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: actionType, messageId: msgId, userId: currentUser.id })
+      });
+
+      if (res.ok) {
+        setMessages(prev => prev.filter(m => m.id !== msgId));
+      }
+    } catch (err) {}
+  };
+
+  // 13. Add Contact Handler
+  const handleSearchContact = async (query: string) => {
+    setContactSearchInput(query);
+    setAddContactMessage('');
+
+    if (!query.trim() || !currentUser) {
+      setContactSearchResults([]);
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/contacts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'search', userId: currentUser.id, contactUsername: query })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setContactSearchResults(data.users || []);
+      }
+    } catch (err) {}
+  };
+
+  const handleAddContact = async (targetUsername: string) => {
+    if (!currentUser) return;
+    setAddContactMessage('');
+
+    try {
+      const res = await fetch('/api/contacts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'add', userId: currentUser.id, contactUsername: targetUsername })
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        setAddContactMessage(data.message);
+        selectContactWithHistory(data.contact);
+        setShowAddContactModal(false);
+        setContactSearchInput('');
+      } else {
+        setAddContactMessage(data.error || 'Failed to add contact');
+      }
+    } catch (err) {
+      setAddContactMessage('Failed to add contact');
+    }
+  };
+
+  // 14. Save Profile Settings
+  const handleSaveProfile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser) return;
+    setProfileSaveMessage('');
+
+    try {
+      const res = await fetch('/api/profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          fullName: editFullName,
+          statusMessage: editStatusMessage
+        })
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        setCurrentUser(data.user);
+        localStorage.setItem('szchat_user_session', JSON.stringify(data.user));
+        setProfileSaveMessage('Profile saved successfully!');
+        setTimeout(() => setShowSettingsDrawer(false), 1200);
+      } else {
+        setProfileSaveMessage(data.error || 'Failed to save profile');
+      }
+    } catch (err) {
+      setProfileSaveMessage('Failed to save profile');
+    }
+  };
+
+  const filteredContacts = contacts.filter(c => 
+    c.fullName.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    c.username.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const formatTime = (ts?: number) => {
+    if (!ts) return '';
+    const date = new Date(ts);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  };
+
+  const getRemainingTimeBadge = (expiresAt?: number) => {
+    if (!expiresAt) return null;
+    const diffSec = Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+    if (diffSec <= 0) return 'Expired';
+    if (diffSec < 3600) return `${Math.ceil(diffSec / 60)}m left`;
+    if (diffSec < 86400) return `${Math.ceil(diffSec / 3600)}h left`;
+    return `${Math.ceil(diffSec / 86400)}d left`;
+  };
+
+  if (!isMounted) {
     return (
-      <main className="container flex-center" style={{ flex: 1 }}>
-        <div className="glass-panel animate-fade-in" style={{ maxWidth: '400px', width: '100%' }}>
-          <h1 className="text-center">Secure E2EE Chat</h1>
-          <p className="text-center text-muted mb-4">Enter a username and passkey to connect securely.</p>
-          
-          <div className="input-group">
-            <label>Username</label>
-            <input 
-              type="text" 
-              className="input" 
-              value={username} 
-              onChange={e => setUsername(e.target.value)} 
-              placeholder="Your name"
-            />
-          </div>
-
-          <div className="input-group">
-            <label>Passkey</label>
-            <input 
-              type="password" 
-              className="input" 
-              value={passkey} 
-              onChange={e => setPasskey(e.target.value)} 
-              placeholder="e.g. secret123"
-            />
-          </div>
-
-          <div style={{ display: 'flex', gap: '1rem', marginTop: '2rem' }}>
-            <button className="btn" style={{ flex: 1 }} onClick={() => handleConnect('initiator')}>Host Room</button>
-            <button className="btn btn-outline" style={{ flex: 1 }} onClick={() => handleConnect('joiner')}>Join Room</button>
+      <div className="auth-overlay" suppressHydrationWarning>
+        <div className="auth-card" suppressHydrationWarning>
+          <div className="auth-header">
+            <h1 className="auth-title">szchat</h1>
+            <p className="auth-subtitle">Loading...</p>
           </div>
         </div>
-      </main>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <div className="auth-overlay" suppressHydrationWarning>
+        <div className="auth-card" suppressHydrationWarning>
+          <div className="auth-header">
+            <img src="/icon.svg" alt="szchat logo" style={{ width: '54px', height: '54px', marginBottom: '8px' }} />
+            <h1 className="auth-title">szchat</h1>
+            <p className="auth-subtitle">Encrypted WhatsApp-Style Web Messaging</p>
+          </div>
+
+          <div className="auth-tabs" suppressHydrationWarning>
+            <button 
+              className={`auth-tab ${authMode === 'login' ? 'active' : ''}`}
+              onClick={() => { setAuthMode('login'); setAuthError(''); }}
+              suppressHydrationWarning
+            >
+              Login
+            </button>
+            <button 
+              className={`auth-tab ${authMode === 'signup' ? 'active' : ''}`}
+              onClick={() => { setAuthMode('signup'); setAuthError(''); }}
+              suppressHydrationWarning
+            >
+              Sign Up
+            </button>
+          </div>
+
+          {authError && <div className="error-banner">{authError}</div>}
+
+          <form onSubmit={handleAuthSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }} suppressHydrationWarning>
+            <div className="form-group" suppressHydrationWarning>
+              <label className="form-label">Username</label>
+              <input 
+                type="text" 
+                required 
+                className="form-input" 
+                placeholder="Enter username" 
+                value={authUsername} 
+                onChange={e => setAuthUsername(e.target.value)}
+                suppressHydrationWarning
+              />
+            </div>
+
+            {authMode === 'signup' && (
+              <div className="form-group" suppressHydrationWarning>
+                <label className="form-label">Full Name</label>
+                <input 
+                  type="text" 
+                  required 
+                  className="form-input" 
+                  placeholder="Enter full name" 
+                  value={authFullName} 
+                  onChange={e => setAuthFullName(e.target.value)}
+                  suppressHydrationWarning
+                />
+              </div>
+            )}
+
+            <div className="form-group" suppressHydrationWarning>
+              <label className="form-label">Password</label>
+              <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+                <input 
+                  type={showAuthPassword ? "text" : "password"} 
+                  required 
+                  className="form-input" 
+                  style={{ width: '100%', paddingRight: '42px' }}
+                  placeholder="Enter password" 
+                  value={authPassword} 
+                  onChange={e => setAuthPassword(e.target.value)}
+                  suppressHydrationWarning
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowAuthPassword(!showAuthPassword)}
+                  style={{
+                    position: 'absolute', right: '10px', background: 'transparent',
+                    border: 'none', color: 'var(--wa-text-secondary)', cursor: 'pointer', fontSize: '16px'
+                  }}
+                  title={showAuthPassword ? "Hide password" : "Show password"}
+                >
+                  {showAuthPassword ? "🙈" : "👁️"}
+                </button>
+              </div>
+            </div>
+
+            <button type="submit" className="btn-primary" disabled={authLoading} style={{ marginTop: '8px' }} suppressHydrationWarning>
+              {authLoading ? 'Processing...' : (authMode === 'login' ? 'LOG IN' : 'CREATE ACCOUNT')}
+            </button>
+          </form>
+
+          <div style={{ textAlign: 'center', marginTop: '10px' }}>
+            <Link href="/admin" style={{ color: 'var(--wa-text-secondary)', fontSize: '12px', textDecoration: 'underline' }}>
+              Admin Portal Login
+            </Link>
+          </div>
+        </div>
+      </div>
     );
   }
 
   return (
-    <main className="chat-container glass-panel animate-fade-in">
-      <div className="chat-header">
-        <div>
-          <h2>Private Chat</h2>
-          {status === 'securely-connected' ? (
-            <div className="badge success">SECURE | Fingerprint: {fingerprint}</div>
-          ) : status === 'rejected' ? (
-            <div className="badge danger">Connection Rejected</div>
+    <div className="app-container">
+      {/* SIDEBAR: Private Contacts */}
+      <aside className={`sidebar ${showMobileChat ? 'hidden-mobile' : ''}`}>
+        <div className="sidebar-header">
+          <div className="user-profile-badge">
+            <div className="avatar" style={{ backgroundColor: currentUser.avatarColor }}>
+              {currentUser.fullName.charAt(0)}
+            </div>
+            <div className="profile-info">
+              <span className="profile-name">{currentUser.fullName}</span>
+              <span className="profile-username">@{currentUser.username}</span>
+              <span className={`db-status-badge ${dbProvider.includes('MongoDB') ? 'mongo' : 'local'}`}>
+                {dbProvider.includes('MongoDB') ? '🟢 MongoDB Atlas' : '🟡 JSON DB'}
+              </span>
+            </div>
+          </div>
+
+          <div className="sidebar-actions">
+            <button 
+              className="icon-btn" 
+              onClick={() => setShowAddContactModal(true)} 
+              title="Add Contact by Username"
+              style={{ color: 'var(--wa-primary)' }}
+            >
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                <path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9 0c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4zm9 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45v2h6v-2c0-2.66-5.33-4-7-4z"/>
+              </svg>
+            </button>
+
+            <button 
+              className="icon-btn" 
+              onClick={() => {
+                setEditFullName(currentUser.fullName);
+                setEditStatusMessage(currentUser.statusMessage || 'Hey there! I am using szchat.');
+                setShowSettingsDrawer(true);
+              }} 
+              title="Settings"
+            >
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+              </svg>
+            </button>
+
+            <Link href="/admin" className="icon-btn" title="Admin Portal">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                <path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm0 10.99h7c-.53 4.12-3.28 7.79-7 8.94V12H5V6.3l7-3.11v8.8s0 0 0 0z"/>
+              </svg>
+            </Link>
+
+            <button className="icon-btn" onClick={handleLogout} title="Logout">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+                <polyline points="16 17 21 12 16 7"></polyline>
+                <line x1="21" y1="12" x2="9" y2="12"></line>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Search */}
+        <div className="sidebar-search">
+          <div className="search-input-wrapper">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="var(--wa-text-muted)" strokeWidth="2">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <input 
+              type="text" 
+              className="search-input" 
+              placeholder="Search contacts..." 
+              value={searchQuery}
+              onChange={e => setSearchQuery(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {/* Contacts */}
+        <div className="contacts-list">
+          {filteredContacts.length === 0 ? (
+            <div style={{ padding: '32px 16px', textAlign: 'center', color: 'var(--wa-text-muted)', fontSize: '13px' }}>
+              <p style={{ marginBottom: '12px' }}>Your contact list is clean & private!</p>
+              <button 
+                className="btn-primary" 
+                style={{ padding: '8px 14px', fontSize: '12px' }}
+                onClick={() => setShowAddContactModal(true)}
+              >
+                ➕ Add Contact by @Username
+              </button>
+            </div>
           ) : (
-            <div className="badge danger">Status: {status}</div>
+            filteredContacts.map(contact => {
+              const isSelected = activeContact?.id === contact.id;
+              return (
+                <div 
+                  key={contact.id} 
+                  className={`contact-item ${isSelected ? 'active' : ''}`}
+                  onClick={() => selectContactWithHistory(contact)}
+                >
+                  <div className="avatar-wrapper">
+                    <div className="avatar" style={{ backgroundColor: contact.avatarColor }}>
+                      {contact.fullName.charAt(0)}
+                    </div>
+                    {contact.isOnline && <div className="online-dot" />}
+                  </div>
+
+                  <div className="contact-details">
+                    <div className="contact-top-row">
+                      <span className="contact-name">{contact.fullName}</span>
+                      {contact.lastMessage && (
+                        <span className="contact-time">{formatTime(contact.lastMessage.timestamp)}</span>
+                      )}
+                    </div>
+
+                    <div className="contact-bottom-row">
+                      <span className={`contact-preview ${isSelected && isPeerTyping ? 'typing-text' : ''}`}>
+                        {isSelected && isPeerTyping ? 'typing...' : (
+                          contact.lastMessage ? (
+                            contact.lastMessage.fileType === 'image' ? '📷 Photo' :
+                            contact.lastMessage.fileType === 'audio' ? '🎤 Voice Note' :
+                            (decryptedTexts[contact.lastMessage.id] || contact.lastMessage.text || '🔒 Encrypted Message')
+                          ) : `@${contact.username}`
+                        )}
+                      </span>
+                      {contact.unreadCount ? (
+                        <div className="unread-badge">{contact.unreadCount}</div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              );
+            })
           )}
         </div>
-      </div>
+      </aside>
 
-      {cameraActive && (
-        <div className="camera-overlay">
-          <video ref={videoRef} autoPlay playsInline />
-          <button className="btn camera-btn" onClick={takePhoto}>📸 Snap</button>
-          <button className="btn camera-cancel" onClick={() => setCameraActive(false)}>Cancel</button>
+      {/* Add Contact Modal */}
+      {showAddContactModal && (
+        <div className="auth-overlay">
+          <div className="auth-card" style={{ maxWidth: '440px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2 style={{ fontSize: '18px', fontWeight: '700' }}>➕ Add Contact by Username</h2>
+              <button className="icon-btn" onClick={() => setShowAddContactModal(false)}>❌</button>
+            </div>
+
+            <p style={{ fontSize: '13px', color: 'var(--wa-text-secondary)' }}>
+              Enter the exact username of the person you want to add to your private chat list.
+            </p>
+
+            {addContactMessage && <div className="error-banner">{addContactMessage}</div>}
+
+            <div className="form-group">
+              <input 
+                type="text" 
+                className="form-input" 
+                placeholder="Type @username (e.g. john)" 
+                value={contactSearchInput} 
+                onChange={e => handleSearchContact(e.target.value)}
+              />
+            </div>
+
+            <div style={{ maxHeight: '200px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {contactSearchResults.map(user => (
+                <div key={user.id} style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  padding: '10px 12px', background: 'var(--wa-header-dark)', borderRadius: '10px'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                    <div className="avatar sm" style={{ backgroundColor: user.avatarColor }}>
+                      {user.fullName.charAt(0)}
+                    </div>
+                    <div>
+                      <div style={{ fontSize: '14px', fontWeight: '600' }}>{user.fullName}</div>
+                      <div style={{ fontSize: '12px', color: 'var(--wa-text-secondary)' }}>@{user.username}</div>
+                    </div>
+                  </div>
+                  <button 
+                    className="btn-primary" 
+                    style={{ padding: '6px 12px', fontSize: '12px' }}
+                    onClick={() => handleAddContact(user.username)}
+                  >
+                    Add Contact
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <button 
+              className="btn-primary" 
+              style={{ background: 'var(--wa-header-dark)', color: '#fff' }}
+              onClick={() => handleAddContact(contactSearchInput)}
+            >
+              Add @{contactSearchInput || 'username'}
+            </button>
+          </div>
         </div>
       )}
 
-      <div className="chat-messages">
-        {status === 'waiting-approval' && (
-          <div className="text-center text-muted mt-4">
-            <p>Waiting for the host to approve your connection...</p>
-          </div>
-        )}
-
-        {status === 'approval-needed' && (
-          <div className="text-center mt-4">
-            <p style={{ marginBottom: '1rem', fontWeight: 'bold' }}>{theirUsername} is trying to join.</p>
-            <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center' }}>
-              <button className="btn" style={{ background: 'var(--success)' }} onClick={approveConnection}>Approve</button>
-              <button className="btn" style={{ background: 'var(--danger)' }} onClick={rejectConnection}>Reject</button>
+      {/* WhatsApp Settings Drawer */}
+      {showSettingsDrawer && (
+        <div className="auth-overlay">
+          <div className="auth-card" style={{ maxWidth: '460px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2 style={{ fontSize: '18px', fontWeight: '700' }}>⚙️ Settings</h2>
+              <button className="icon-btn" onClick={() => setShowSettingsDrawer(false)}>❌</button>
             </div>
-          </div>
-        )}
 
-        {status === 'rejected' && (
-          <div className="text-center text-muted mt-4">
-            <p style={{ color: 'var(--danger)' }}>The host rejected your connection request.</p>
-            <button className="btn mt-4" onClick={() => window.location.reload()}>Go Back</button>
-          </div>
-        )}
-
-        {chatMessages.map(msg => (
-          <div key={msg.id} className={`message ${msg.sender === 'me' ? 'message-mine' : 'message-theirs'}`}>
-            {msg.text && <p>{msg.text}</p>}
-            
-            {msg.photo && msg.viewOnce && !(msg as any).revealed && msg.sender === 'them' && (
-              <button className="btn" onClick={() => {
-                setChatMessages(prev => prev.map(m => m.id === msg.id ? { ...m, revealed: true } : m));
-                setTimeout(() => setChatMessages(prev => prev.filter(m => m.id !== msg.id)), 3000);
-              }}>⏱️ View Once</button>
-            )}
-            
-            {msg.photo && msg.viewOnce && msg.sender === 'me' && (
-              <div className="text-muted">⏱️ View-once photo sent</div>
-            )}
-
-            {msg.photo && (!msg.viewOnce || (msg as any).revealed) && (
-              <div style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}>
-                <img src={msg.photo} alt="Shared photo" className="image-preview" />
-                {!msg.viewOnce && (
-                  <a 
-                    href={msg.photo} 
-                    download={`secure-photo-${msg.id}.jpg`}
-                    className="btn icon-btn" 
-                    style={{ position: 'absolute', bottom: '1rem', right: '1rem', padding: '0.5rem', background: 'rgba(0,0,0,0.6)', borderRadius: '50%', color: 'white' }}
-                    title="Download Photo"
-                  >
-                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                  </a>
-                )}
+            {profileSaveMessage && (
+              <div className="error-banner" style={{ background: 'rgba(0, 168, 132, 0.15)', borderColor: 'var(--wa-primary)', color: 'var(--wa-primary)' }}>
+                {profileSaveMessage}
               </div>
             )}
-          </div>
-        ))}
-        <div ref={chatBottomRef} />
-      </div>
 
-      <form className="chat-input-area" onSubmit={handleSendText}>
-        <div className="media-controls">
-          <button type="button" className={`btn icon-btn ${viewOnceMode ? 'view-once-active' : ''}`} onClick={() => setViewOnceMode(!viewOnceMode)} disabled={status !== 'securely-connected'} title="View Once Mode">
-            <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-          </button>
-          <button type="button" className="btn icon-btn" onClick={startCamera} disabled={status !== 'securely-connected'} title="Camera">
-            <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
-          </button>
-          <label className="btn icon-btn" style={{ opacity: status !== 'securely-connected' ? 0.5 : 1, cursor: 'pointer' }} title="Gallery">
-            <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
-            <input type="file" accept="image/*" style={{ display: 'none' }} onChange={handleFilePhoto} disabled={status !== 'securely-connected'} />
-          </label>
+            <form onSubmit={handleSaveProfile} style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              <div className="form-group">
+                <label className="form-label">Your Full Name</label>
+                <input 
+                  type="text" 
+                  required
+                  className="form-input" 
+                  value={editFullName} 
+                  onChange={e => setEditFullName(e.target.value)}
+                />
+              </div>
+
+              <div className="form-group">
+                <label className="form-label">Status Message (About)</label>
+                <input 
+                  type="text" 
+                  className="form-input" 
+                  value={editStatusMessage} 
+                  onChange={e => setEditStatusMessage(e.target.value)}
+                />
+              </div>
+
+              <div style={{ background: 'var(--wa-header-dark)', padding: '12px', borderRadius: '10px', fontSize: '13px' }}>
+                <div style={{ fontWeight: '600', color: 'var(--wa-primary)', marginBottom: '4px' }}>Storage & Database Engine</div>
+                <div style={{ color: 'var(--wa-text-secondary)' }}>Active Database: {dbProvider}</div>
+              </div>
+
+              <button type="submit" className="btn-primary" style={{ marginTop: '8px' }}>
+                SAVE CHANGES
+              </button>
+            </form>
+          </div>
         </div>
-        
-        <input 
-          type="text" 
-          className="input" 
-          placeholder="Encrypted message..." 
-          value={inputText}
-          onChange={e => setInputText(e.target.value)}
-          disabled={status !== 'securely-connected'}
-        />
-        <button type="submit" className="btn" disabled={status !== 'securely-connected' || !inputText.trim()}>
-          Send
-        </button>
-      </form>
-    </main>
+      )}
+
+      {/* MAIN CHAT AREA */}
+      <main className={`main-chat ${showMobileChat && activeContact ? 'active-mobile' : ''}`}>
+        {activeContact ? (
+          <>
+            {/* Header */}
+            <div className="chat-header">
+              <div className="chat-header-info">
+                <button 
+                  className="icon-btn back-btn-mobile" 
+                  onClick={closeMobileChatWithHistory}
+                  title="Back to contacts"
+                >
+                  <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polyline points="15 18 9 12 15 6"></polyline>
+                  </svg>
+                </button>
+
+                <div className="avatar-wrapper">
+                  <div className="avatar sm" style={{ backgroundColor: activeContact.avatarColor }}>
+                    {activeContact.fullName.charAt(0)}
+                  </div>
+                  {activeContact.isOnline && <div className="online-dot" />}
+                </div>
+
+                <div className="chat-user-title">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <span className="chat-username">{activeContact.fullName}</span>
+                    <span style={{ fontSize: '11px', color: 'var(--wa-primary)', fontWeight: '600' }}>🔒 E2EE</span>
+                  </div>
+                  <span className={`chat-status ${isPeerTyping ? 'typing' : ''}`}>
+                    {isPeerTyping ? 'typing...' : (activeContact.isOnline ? 'online' : 'offline')}
+                  </span>
+                </div>
+              </div>
+
+              {/* Disappearing Messages Trigger */}
+              <div style={{ position: 'relative' }}>
+                <button 
+                  className={`disappearing-timer-btn ${disappearingOption !== 'off' ? 'active' : ''}`}
+                  onClick={() => setShowDisappearingMenu(!showDisappearingMenu)}
+                  title="Configure Disappearing Messages"
+                >
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polyline points="12 6 12 12 16 14"></polyline>
+                  </svg>
+                  <span>⏱️ {DISAPPEARING_LABELS[disappearingOption]}</span>
+                </button>
+
+                {showDisappearingMenu && (
+                  <div className="disappearing-menu-popover">
+                    <div style={{ padding: '6px 12px', fontSize: '11px', fontWeight: '700', color: 'var(--wa-text-muted)', textTransform: 'uppercase' }}>
+                      Disappearing Messages
+                    </div>
+                    {(['off', 'view_once', '1h', '24h', '7d'] as DisappearingOption[]).map(option => (
+                      <div 
+                        key={option}
+                        className={`disappearing-option-item ${disappearingOption === option ? 'selected' : ''}`}
+                        onClick={() => {
+                          setDisappearingOption(option);
+                          setShowDisappearingMenu(false);
+                        }}
+                      >
+                        <span>{DISAPPEARING_LABELS[option]}</span>
+                        {disappearingOption === option && <span>✓</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Camera Overlay */}
+            {showCamera && (
+              <div style={{
+                position: 'absolute', inset: 0, zIndex: 200, background: '#000',
+                display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center'
+              }}>
+                <video ref={videoRef} autoPlay playsInline style={{ maxWidth: '100%', maxHeight: '70vh', borderRadius: '12px' }} />
+                <div style={{ display: 'flex', gap: '16px', marginTop: '20px' }}>
+                  <button className="btn-primary" onClick={capturePhoto}>📸 Take Photo</button>
+                  <button className="btn-primary" style={{ background: 'var(--wa-header-dark)', color: '#fff' }} onClick={() => {
+                    if (videoRef.current && videoRef.current.srcObject) {
+                      (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+                    }
+                    setShowCamera(false);
+                  }}>Cancel</button>
+                </div>
+              </div>
+            )}
+
+            {/* Messages Feed Container with Internal Scroll Locking */}
+            <div className="chat-messages-container" ref={messagesContainerRef} onClick={() => setSelectedMessageMenuId(null)}>
+              <div style={{ textAlign: 'center', padding: '8px 0', fontSize: '11px', color: 'var(--wa-primary)', background: 'rgba(0, 168, 132, 0.1)', borderRadius: '8px', marginBottom: '8px' }}>
+                🔒 Messages are end-to-end encrypted (AES-GCM 256-bit). Stored on {dbProvider}.
+              </div>
+
+              {messages.map(msg => {
+                const isMine = msg.senderId === currentUser.id;
+                const remainingBadge = getRemainingTimeBadge(msg.expiresAt);
+                const decryptedContent = decryptedTexts[msg.id] || msg.text || '';
+                const isMenuOpen = selectedMessageMenuId === msg.id;
+
+                return (
+                  <div 
+                    key={msg.id} 
+                    className={`message-bubble ${isMine ? 'mine' : 'theirs'}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelectedMessageMenuId(isMenuOpen ? null : msg.id);
+                    }}
+                  >
+                    {/* Message Context Action Menu */}
+                    {isMenuOpen && (
+                      <div style={{
+                        position: 'absolute', top: '-40px', right: isMine ? '0' : 'auto', left: isMine ? 'auto' : '0',
+                        background: 'var(--wa-header-dark)', border: '1px solid var(--wa-border-dark)', borderRadius: '8px',
+                        padding: '4px', display: 'flex', gap: '6px', zIndex: 100, boxShadow: 'var(--shadow-md)'
+                      }}>
+                        <button 
+                          style={{ background: 'transparent', border: 'none', color: '#fff', fontSize: '12px', padding: '4px 8px', cursor: 'pointer' }}
+                          onClick={() => {
+                            if (decryptedContent) navigator.clipboard.writeText(decryptedContent);
+                            setSelectedMessageMenuId(null);
+                          }}
+                        >
+                          📋 Copy
+                        </button>
+                        <button 
+                          style={{ background: 'transparent', border: 'none', color: 'var(--wa-danger)', fontSize: '12px', padding: '4px 8px', cursor: 'pointer' }}
+                          onClick={() => handleDeleteMessage(msg.id, 'deleteForMe')}
+                        >
+                          🗑️ Delete for Me
+                        </button>
+                        {isMine && (
+                          <button 
+                            style={{ background: 'transparent', border: 'none', color: 'var(--wa-danger)', fontSize: '12px', padding: '4px 8px', cursor: 'pointer' }}
+                            onClick={() => handleDeleteMessage(msg.id, 'deleteForEveryone')}
+                          >
+                            🚨 Delete for Everyone
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {/* View Once Logic */}
+                    {msg.viewOnce ? (
+                      msg.viewOnceOpened ? (
+                        <div className="view-once-opened">⏱️ View-once photo opened</div>
+                      ) : (
+                        !isMine ? (
+                          <button className="view-once-btn" onClick={() => handleViewOnceOpen(msg.id)}>
+                            ⏱️ View Once Photo (Click to reveal)
+                          </button>
+                        ) : (
+                          <div className="view-once-opened">⏱️ View-once photo sent</div>
+                        )
+                      )
+                    ) : null}
+
+                    {/* Image */}
+                    {msg.fileType === 'image' && decryptedContent && (!msg.viewOnce || (msg.viewOnce && msg.viewOnceOpened)) && (
+                      <img src={decryptedContent} alt="Attachment" className="media-image" />
+                    )}
+
+                    {/* Voice Note */}
+                    {msg.fileType === 'audio' && decryptedContent && (
+                      <div className="audio-player-container">
+                        <audio controls src={decryptedContent} />
+                      </div>
+                    )}
+
+                    {/* Text */}
+                    {!msg.fileType && <p style={{ margin: 0 }}>{decryptedContent}</p>}
+
+                    {/* Metadata & WhatsApp Ticks */}
+                    <div className="message-meta">
+                      {remainingBadge && (
+                        <span className="timer-badge">⏱️ {remainingBadge}</span>
+                      )}
+                      <span>{formatTime(msg.timestamp)}</span>
+                      {isMine && (
+                        <span className={`tick-mark ${msg.status === 'read' ? 'blue' : 'gray'}`}>
+                          {msg.status === 'sent' ? (
+                            <svg viewBox="0 0 16 16"><path d="M15.01 3.3L6.41 11.9 1.4 6.89l1.41-1.41 3.6 3.6 7.19-7.19z"/></svg>
+                          ) : (
+                            <svg viewBox="0 0 16 16"><path d="M15.01 3.3L6.41 11.9 1.4 6.89l1.41-1.41 3.6 3.6 7.19-7.19zm-3.6 0L4.22 10.49l-1.41-1.41 7.19-7.19z"/></svg>
+                          )}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Emoji Picker */}
+            {showEmojiPicker && (
+              <div className="popover-menu">
+                <div className="emoji-grid">
+                  {POPULAR_EMOJIS.map(emoji => (
+                    <span 
+                      key={emoji} 
+                      className="emoji-item"
+                      onClick={() => {
+                        setInputText(prev => prev + emoji);
+                        setShowEmojiPicker(false);
+                      }}
+                    >
+                      {emoji}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Chat Input Bar - Always Pinned & Visible */}
+            <div className="chat-input-bar">
+              {isRecordingVoice ? (
+                <div className="recording-bar">
+                  <div className="recording-dot" />
+                  <span>Recording Audio... ({recordingTime}s)</span>
+                  <button className="icon-btn" style={{ marginLeft: 'auto', color: 'var(--wa-danger)' }} onClick={() => stopVoiceRecording(false)} title="Cancel">
+                    ❌
+                  </button>
+                  <button className="icon-btn" style={{ color: 'var(--wa-primary)' }} onClick={() => stopVoiceRecording(true)} title="Send Voice Note">
+                    ✓
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <button 
+                    type="button" 
+                    className={`icon-btn ${showEmojiPicker ? 'active-icon' : ''}`}
+                    onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+                    title="Emoji"
+                  >
+                    😊
+                  </button>
+
+                  <input 
+                    type="file" 
+                    accept="image/*" 
+                    ref={fileInputRef} 
+                    style={{ display: 'none' }} 
+                    onChange={handleFileUpload} 
+                  />
+                  <button 
+                    type="button" 
+                    className="icon-btn"
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Attach Image"
+                  >
+                    📎
+                  </button>
+
+                  <button 
+                    type="button" 
+                    className="icon-btn"
+                    onClick={startCamera}
+                    title="Camera"
+                  >
+                    📸
+                  </button>
+
+                  <input 
+                    type="text" 
+                    className="input-box" 
+                    placeholder="Encrypted message..." 
+                    value={inputText}
+                    onChange={e => handleInputChange(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        handleSendMessage();
+                      }
+                    }}
+                  />
+
+                  <button 
+                    type="button" 
+                    className="send-btn" 
+                    onClick={handleSendMessage} 
+                    disabled={!inputText.trim()}
+                    title="Send Message"
+                    style={{ opacity: inputText.trim() ? 1 : 0.6 }}
+                  >
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+                      <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                    </svg>
+                  </button>
+
+                  <button 
+                    type="button" 
+                    className="icon-btn" 
+                    onClick={startVoiceRecording} 
+                    title="Record Voice Note"
+                  >
+                    🎤
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="empty-chat-state">
+            <img src="/icon.svg" alt="szchat logo" style={{ width: '80px', height: '80px', marginBottom: '16px' }} />
+            <h2>szchat</h2>
+            <p style={{ marginTop: '8px', maxWidth: '360px', fontSize: '14px', lineHeight: '1.5' }}>
+              Add a contact by @username to start a private, end-to-end encrypted (AES-GCM 256-bit) chat session.
+            </p>
+            <button 
+              className="btn-primary" 
+              style={{ marginTop: '16px', padding: '10px 20px' }}
+              onClick={() => setShowAddContactModal(true)}
+            >
+              ➕ Add Contact by Username
+            </button>
+          </div>
+        )}
+      </main>
+    </div>
   );
 }

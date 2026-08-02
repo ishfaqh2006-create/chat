@@ -1,0 +1,10 @@
+{
+  "config": {
+    "maxUsers": 20,
+    "adminName": "Ishfaq",
+    "adminPassword": "Ishfaq@11"
+  },
+  "users": [],
+  "messages": [],
+  "typing": {}
+}
