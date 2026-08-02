@@ -898,15 +898,14 @@ html, body {
 }
 
 .admin-container {
-  /* Admin page must scroll, unlike the chat app which is fixed-height */
-  min-height: 100dvh;
-  height: auto;
+  height: 100dvh;
+  width: 100%;
   background-color: var(--wa-bg-dark);
   padding: 24px;
   color: var(--wa-text-primary);
   overflow-y: auto;
-  /* Override the html/body overflow:hidden for admin page */
   position: relative;
+  box-sizing: border-box;
 }
 
 .admin-header {
@@ -957,4 +956,9 @@ html, body {
   border-radius: 6px;
   font-size: 12px;
   font-family: monospace;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
 }

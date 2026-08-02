@@ -65,6 +65,7 @@ export default function SZChatApp() {
 
   // App & Database Provider State
   const [contacts, setContacts] = useState<UserProfile[]>([]);
+  const [contactsLoading, setContactsLoading] = useState(true);
   const [activeContact, setActiveContact] = useState<UserProfile | null>(null);
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [decryptedTexts, setDecryptedTexts] = useState<Record<string, string>>({});
@@ -235,7 +236,10 @@ export default function SZChatApp() {
             setContacts(newContacts);
           }
         }
-      } catch (_) {}
+      } catch (_) {
+      } finally {
+        setContactsLoading(false);
+      }
     };
 
     fetchContacts();
@@ -619,6 +623,10 @@ export default function SZChatApp() {
       const data = await res.json();
       if (res.ok) {
         setAddContactMessage(data.message);
+        setContacts(prev => {
+          if (prev.some(c => c.id === data.contact.id)) return prev;
+          return [...prev, data.contact];
+        });
         selectContactWithHistory(data.contact);
         setShowAddContactModal(false);
         setContactSearchInput('');
@@ -873,7 +881,12 @@ export default function SZChatApp() {
 
         {/* Contacts */}
         <div className="contacts-list">
-          {filteredContacts.length === 0 ? (
+          {contactsLoading ? (
+            <div style={{ padding: '32px 16px', textAlign: 'center', color: 'var(--wa-text-muted)', fontSize: '13px' }}>
+              <div style={{ display: 'inline-block', width: '20px', height: '20px', border: '2px solid rgba(255,255,255,0.1)', borderTopColor: 'var(--wa-primary)', borderRadius: '50%', animation: 'spin 1s linear infinite', marginBottom: '8px' }}></div>
+              <p>Loading chats...</p>
+            </div>
+          ) : filteredContacts.length === 0 ? (
             <div style={{ padding: '32px 16px', textAlign: 'center', color: 'var(--wa-text-muted)', fontSize: '13px' }}>
               <p style={{ marginBottom: '12px' }}>Your contact list is clean & private!</p>
               <button 
