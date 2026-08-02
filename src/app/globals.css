@@ -489,6 +489,27 @@ html, body {
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Optimistic message — slightly dim while waiting for server */
+.message-bubble.optimistic {
+  opacity: 0.75;
+}
+
+/* Flash highlight when scrolling to a replied message */
+@keyframes highlightFlash {
+  0%, 100% { background-color: inherit; }
+  30% { background-color: rgba(0, 168, 132, 0.35); }
+}
+
+.highlight-flash {
+  animation: highlightFlash 1s ease-out;
+}
+
+/* Optimistic tick — faded sending state */
+.optimistic-tick svg path {
+  fill: rgba(255, 255, 255, 0.35) !important;
+}
+
+
 .message-bubble.mine {
   align-self: flex-end;
   background-color: var(--wa-bubble-mine);

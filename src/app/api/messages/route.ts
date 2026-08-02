@@ -15,18 +15,14 @@ export async function GET(req: Request) {
     await connectToDatabase();
     const now = Date.now();
 
-    // Delete expired messages
-    await MessageModel.deleteMany({
-      expiresAt: { $lt: now },
-    }).catch(() => {});
-
-    // Mark as read
-    await MessageModel.updateMany(
+    // Asynchronously delete expired messages & mark received messages as read
+    MessageModel.deleteMany({ expiresAt: { $lt: now } }).catch(() => {});
+    MessageModel.updateMany(
       { senderId: peerId, receiverId: userId, status: { $ne: 'read' } },
       { status: 'read' }
     ).catch(() => {});
 
-    // Fetch conversation
+    // Fetch conversation immediately
     const messages = await MessageModel.find({
       $or: [
         { senderId: userId, receiverId: peerId },
@@ -42,8 +38,9 @@ export async function GET(req: Request) {
         },
       ],
     })
+      .select('id senderId receiverId text fileUrl fileType ciphertext iv encrypted timestamp status viewOnce viewOnceOpened disappearingOption expiresAt replyToId replyToText replyToSender')
       .sort({ timestamp: 1 })
-      .lean<any[]>();
+      .lean();
 
     return NextResponse.json({ messages });
   } catch (err) {
@@ -65,6 +62,9 @@ export async function POST(req: Request) {
       iv,
       viewOnce,
       disappearingOption,
+      replyToId,
+      replyToText,
+      replyToSender,
     } = body;
 
     if (!senderId || !receiverId) {
@@ -109,6 +109,8 @@ export async function POST(req: Request) {
       disappearingOption: chosenOption,
       expiresAt,
       deletedFor: [],
+      // Reply fields — only set if replying to a message
+      ...(replyToId ? { replyToId, replyToText, replyToSender } : {}),
     };
 
     const saved = await MessageModel.create(newMsg);

@@ -35,6 +35,11 @@ type MessageItem = {
   disappearingOption?: DisappearingOption;
   expiresAt?: number;
   deletedFor?: string[];
+  // Reply-to fields
+  replyToId?: string;
+  replyToText?: string;
+  replyToSender?: string;
+  isOptimistic?: boolean; // client-only flag for instant UI
 };
 
 const POPULAR_EMOJIS = ['😊', '😂', '😍', '👍', '❤️', '🔥', '🎉', '🙏', '👏', '💯', '🚀', '✨', '😎', '🤣', '😭', '🙌', '🤝', '🥳'];
@@ -91,6 +96,13 @@ export default function SZChatApp() {
   // Selected Message Menu State
   const [selectedMessageMenuId, setSelectedMessageMenuId] = useState<string | null>(null);
 
+  // Reply State
+  const [replyTo, setReplyTo] = useState<{ id: string; text: string; senderName: string } | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Typing debounce ref (prevents spamming the typing API)
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   // Mobile View & Hydration Guard
   const [showMobileChat, setShowMobileChat] = useState(false);
   const [isMounted, setIsMounted] = useState(false);
@@ -98,6 +110,8 @@ export default function SZChatApp() {
   // Refs for State Diffing & Scroll Lock
   const contactsRef = useRef<UserProfile[]>([]);
   const messagesRef = useRef<MessageItem[]>([]);
+  // Track which message IDs have already been decrypted (avoid re-decrypting)
+  const decryptedIdsRef = useRef<Set<string>>(new Set());
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -204,7 +218,7 @@ export default function SZChatApp() {
     setShowMobileChat(false);
   };
 
-  // 4. Real-time Contacts Polling with Data Diffing (Stops Blinking)
+  // 4. Contacts Polling — 3s is enough; contacts don't change that fast
   useEffect(() => {
     if (!currentUser) return;
 
@@ -214,27 +228,27 @@ export default function SZChatApp() {
         if (res.ok) {
           const data = await res.json();
           const newContacts: UserProfile[] = data.users || [];
-          if (data.dbProvider) {
-            setDbProvider(data.dbProvider);
-          }
+          if (data.dbProvider) setDbProvider(data.dbProvider);
 
-          const currentStr = JSON.stringify(contactsRef.current);
-          const newStr = JSON.stringify(newContacts);
-          if (currentStr !== newStr) {
+          // Shallow diff — only re-render if data actually changed
+          if (JSON.stringify(contactsRef.current) !== JSON.stringify(newContacts)) {
             setContacts(newContacts);
           }
         }
-      } catch (err) {}
+      } catch (_) {}
     };
 
     fetchContacts();
-    const interval = setInterval(fetchContacts, 2000);
+    const interval = setInterval(fetchContacts, 3000);
     return () => clearInterval(interval);
   }, [currentUser]);
 
-  // 5. Poll Messages & Typing with Internal Container Scroll (Stops Page Scrolling & Interface Switching)
+  // 5. Poll Messages — 800ms for near-real-time feel; only decrypt NEW messages
   useEffect(() => {
     if (!currentUser || !activeContact) return;
+
+    // Reset decryption cache when conversation changes
+    decryptedIdsRef.current = new Set();
 
     const fetchConversation = async () => {
       try {
@@ -243,84 +257,132 @@ export default function SZChatApp() {
           const msgData = await msgRes.json();
           const rawMsgs: MessageItem[] = msgData.messages || [];
 
-          const currentMsgsStr = JSON.stringify(messagesRef.current);
-          const newMsgsStr = JSON.stringify(rawMsgs);
+          // Diff by last message id + count to avoid full stringify
+          const prevLast = messagesRef.current[messagesRef.current.length - 1]?.id;
+          const newLast = rawMsgs[rawMsgs.length - 1]?.id;
+          const prevCount = messagesRef.current.filter(m => !m.isOptimistic).length;
 
-          if (currentMsgsStr !== newMsgsStr) {
+          if (prevLast !== newLast || prevCount !== rawMsgs.length) {
+            // Replace optimistic messages with server-confirmed ones
             setMessages(rawMsgs);
 
+            // Only decrypt messages we haven't seen yet
             const key = await getSymmetricKeyForPair(currentUser.id, activeContact.id);
             const newDecrypted: Record<string, string> = {};
+            let hasNew = false;
 
             for (const m of rawMsgs) {
-              if (m.ciphertext && m.iv) {
-                try {
-                  const dec = await decryptE2EE(key, m.ciphertext, m.iv);
-                  newDecrypted[m.id] = dec;
-                } catch (e) {
-                  newDecrypted[m.id] = m.text || '[Encrypted Message]';
+              if (!decryptedIdsRef.current.has(m.id)) {
+                hasNew = true;
+                decryptedIdsRef.current.add(m.id);
+                if (m.ciphertext && m.iv) {
+                  try {
+                    newDecrypted[m.id] = await decryptE2EE(key, m.ciphertext, m.iv);
+                  } catch {
+                    newDecrypted[m.id] = m.text || '[Encrypted]';
+                  }
+                } else if (m.text) {
+                  newDecrypted[m.id] = m.text;
                 }
-              } else if (m.text) {
-                newDecrypted[m.id] = m.text;
               }
             }
-            setDecryptedTexts(prev => ({ ...prev, ...newDecrypted }));
+            if (hasNew) setDecryptedTexts(prev => ({ ...prev, ...newDecrypted }));
+          } else {
+            // Same messages — only update status ticks (no re-render of bubbles)
+            const prevStatuses = messagesRef.current.map(m => m.status).join();
+            const newStatuses = rawMsgs.map((m: MessageItem) => m.status).join();
+            if (prevStatuses !== newStatuses) {
+              setMessages(rawMsgs);
+            }
           }
         }
 
+        // Fetch typing separately — it's cheap
         const typeRes = await fetch(`/api/typing?userId=${currentUser.id}&peerId=${activeContact.id}`);
         if (typeRes.ok) {
           const typeData = await typeRes.json();
           setIsPeerTyping(typeData.isTyping);
         }
-      } catch (err) {}
+      } catch (_) {}
     };
 
     fetchConversation();
-    const interval = setInterval(fetchConversation, 1500);
+    const interval = setInterval(fetchConversation, 800);
     return () => clearInterval(interval);
   }, [currentUser, activeContact]);
 
-  // Lock Scroll inside Container (NEVER scroll window/page)
+  // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     if (messagesContainerRef.current) {
       messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
     }
   }, [messages, isPeerTyping]);
 
-  // 6. Typing Signal
+  // 6. Typing Signal — debounced to avoid API spam
   const handleInputChange = (text: string) => {
     setInputText(text);
     if (!currentUser || !activeContact) return;
+
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
 
     if (text.trim().length > 0) {
       fetch('/api/typing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: currentUser.id, typingTo: activeContact.id })
+        body: JSON.stringify({ userId: currentUser.id, typingTo: activeContact.id }),
       }).catch(() => {});
+      // Auto-clear typing after 3s of no input
+      typingTimeoutRef.current = setTimeout(() => {
+        fetch('/api/typing', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: currentUser.id, typingTo: null }),
+        }).catch(() => {});
+      }, 3000);
     } else {
       fetch('/api/typing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: currentUser.id, typingTo: null })
+        body: JSON.stringify({ userId: currentUser.id, typingTo: null }),
       }).catch(() => {});
     }
   };
 
-  // 7. Send E2EE Text Message (Enter & Button)
+  // 7. Send Message — OPTIMISTIC UI (instant) + reply support
   const handleSendMessage = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!inputText.trim() || !currentUser || !activeContact) return;
 
     const textToSend = inputText.trim();
+    const currentReplyTo = replyTo;
+
+    // Clear input & reply bar immediately (feels instant)
     setInputText('');
+    setReplyTo(null);
     setShowEmojiPicker(false);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+
+    // ── OPTIMISTIC: add to UI right now with a temp id ──
+    const optimisticId = 'opt_' + Date.now();
+    const optimisticMsg: MessageItem = {
+      id: optimisticId,
+      senderId: currentUser.id,
+      receiverId: activeContact.id,
+      text: textToSend,
+      timestamp: Date.now(),
+      status: 'sent',
+      isOptimistic: true,
+      replyToId: currentReplyTo?.id,
+      replyToText: currentReplyTo?.text,
+      replyToSender: currentReplyTo?.senderName,
+    };
+    setMessages(prev => [...prev.filter(m => !m.isOptimistic || m.id !== optimisticId), optimisticMsg]);
+    setDecryptedTexts(prev => ({ ...prev, [optimisticId]: textToSend }));
 
     fetch('/api/typing', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ userId: currentUser.id, typingTo: null })
+      body: JSON.stringify({ userId: currentUser.id, typingTo: null }),
     }).catch(() => {});
 
     try {
@@ -335,17 +397,35 @@ export default function SZChatApp() {
           receiverId: activeContact.id,
           ciphertext,
           iv,
-          disappearingOption: disappearingOption,
-          viewOnce: disappearingOption === 'view_once'
-        })
+          disappearingOption,
+          viewOnce: disappearingOption === 'view_once',
+          replyToId: currentReplyTo?.id,
+          replyToText: currentReplyTo?.text,
+          replyToSender: currentReplyTo?.senderName,
+        }),
       });
 
       if (res.ok) {
         const data = await res.json();
-        setMessages(prev => [...prev, data.message]);
+        // Replace optimistic message with server-confirmed one
+        setMessages(prev => prev.map(m => m.id === optimisticId ? { ...data.message } : m));
         setDecryptedTexts(prev => ({ ...prev, [data.message.id]: textToSend }));
+        decryptedIdsRef.current.add(data.message.id);
+      } else {
+        // Remove failed optimistic message
+        setMessages(prev => prev.filter(m => m.id !== optimisticId));
       }
-    } catch (err) {}
+    } catch {
+      setMessages(prev => prev.filter(m => m.id !== optimisticId));
+    }
+  };
+
+  // Helper to start replying to a message
+  const handleReply = (msg: MessageItem, senderName: string) => {
+    const text = decryptedTexts[msg.id] || msg.text || (msg.fileType === 'image' ? '📷 Photo' : msg.fileType === 'audio' ? '🎤 Voice note' : '[message]');
+    setReplyTo({ id: msg.id, text, senderName });
+    setSelectedMessageMenuId(null);
+    setTimeout(() => inputRef.current?.focus(), 50);
   };
 
   // 8. Image & Media Attachments
@@ -949,11 +1029,6 @@ export default function SZChatApp() {
                 />
               </div>
 
-              <div style={{ background: 'var(--wa-header-dark)', padding: '12px', borderRadius: '10px', fontSize: '13px' }}>
-                <div style={{ fontWeight: '600', color: 'var(--wa-primary)', marginBottom: '4px' }}>Storage & Database Engine</div>
-                <div style={{ color: 'var(--wa-text-secondary)' }}>Active Database: {dbProvider}</div>
-              </div>
-
               <button type="submit" className="btn-primary" style={{ marginTop: '8px' }}>
                 SAVE CHANGES
               </button>
@@ -1055,8 +1130,8 @@ export default function SZChatApp() {
 
             {/* Messages Feed Container with Internal Scroll Locking */}
             <div className="chat-messages-container" ref={messagesContainerRef} onClick={() => setSelectedMessageMenuId(null)}>
-              <div style={{ textAlign: 'center', padding: '8px 0', fontSize: '11px', color: 'var(--wa-primary)', background: 'rgba(0, 168, 132, 0.1)', borderRadius: '8px', marginBottom: '8px' }}>
-                🔒 Messages are end-to-end encrypted (AES-GCM 256-bit). Stored on {dbProvider}.
+              <div style={{ textAlign: 'center', padding: '8px 12px', fontSize: '11px', color: '#8696a0', background: '#182229', borderRadius: '8px', marginBottom: '12px', maxWidth: '380px', margin: '0 auto 12px auto' }}>
+                🔒 Messages are end-to-end encrypted. No one outside of this chat can read or listen to them.
               </div>
 
               {messages.map(msg => {
@@ -1066,9 +1141,10 @@ export default function SZChatApp() {
                 const isMenuOpen = selectedMessageMenuId === msg.id;
 
                 return (
-                  <div 
-                    key={msg.id} 
-                    className={`message-bubble ${isMine ? 'mine' : 'theirs'}`}
+                  <div
+                    key={msg.id}
+                    id={`msg-${msg.id}`}
+                    className={`message-bubble ${isMine ? 'mine' : 'theirs'} ${msg.isOptimistic ? 'optimistic' : ''}`}
                     onClick={(e) => {
                       e.stopPropagation();
                       setSelectedMessageMenuId(isMenuOpen ? null : msg.id);
@@ -1077,33 +1153,68 @@ export default function SZChatApp() {
                     {/* Message Context Action Menu */}
                     {isMenuOpen && (
                       <div style={{
-                        position: 'absolute', top: '-40px', right: isMine ? '0' : 'auto', left: isMine ? 'auto' : '0',
-                        background: 'var(--wa-header-dark)', border: '1px solid var(--wa-border-dark)', borderRadius: '8px',
-                        padding: '4px', display: 'flex', gap: '6px', zIndex: 100, boxShadow: 'var(--shadow-md)'
+                        position: 'absolute', top: '-44px',
+                        right: isMine ? '0' : 'auto', left: isMine ? 'auto' : '0',
+                        background: 'var(--wa-header-dark)', border: '1px solid var(--wa-border-dark)',
+                        borderRadius: '10px', padding: '4px',
+                        display: 'flex', gap: '2px', zIndex: 100, boxShadow: 'var(--shadow-md)',
+                        whiteSpace: 'nowrap',
                       }}>
-                        <button 
-                          style={{ background: 'transparent', border: 'none', color: '#fff', fontSize: '12px', padding: '4px 8px', cursor: 'pointer' }}
-                          onClick={() => {
-                            if (decryptedContent) navigator.clipboard.writeText(decryptedContent);
-                            setSelectedMessageMenuId(null);
-                          }}
+                        <button
+                          style={{ background: 'transparent', border: 'none', color: 'var(--wa-primary)', fontSize: '12px', padding: '5px 8px', cursor: 'pointer', borderRadius: '6px' }}
+                          onClick={(e) => { e.stopPropagation(); handleReply(msg, isMine ? currentUser.fullName : activeContact.fullName); }}
+                        >
+                          ↩️ Reply
+                        </button>
+                        <button
+                          style={{ background: 'transparent', border: 'none', color: '#fff', fontSize: '12px', padding: '5px 8px', cursor: 'pointer', borderRadius: '6px' }}
+                          onClick={(e) => { e.stopPropagation(); if (decryptedContent) navigator.clipboard.writeText(decryptedContent); setSelectedMessageMenuId(null); }}
                         >
                           📋 Copy
                         </button>
-                        <button 
-                          style={{ background: 'transparent', border: 'none', color: 'var(--wa-danger)', fontSize: '12px', padding: '4px 8px', cursor: 'pointer' }}
-                          onClick={() => handleDeleteMessage(msg.id, 'deleteForMe')}
+                        <button
+                          style={{ background: 'transparent', border: 'none', color: 'var(--wa-danger)', fontSize: '12px', padding: '5px 8px', cursor: 'pointer', borderRadius: '6px' }}
+                          onClick={(e) => { e.stopPropagation(); handleDeleteMessage(msg.id, 'deleteForMe'); }}
                         >
-                          🗑️ Delete for Me
+                          🗑️ Delete
                         </button>
                         {isMine && (
-                          <button 
-                            style={{ background: 'transparent', border: 'none', color: 'var(--wa-danger)', fontSize: '12px', padding: '4px 8px', cursor: 'pointer' }}
-                            onClick={() => handleDeleteMessage(msg.id, 'deleteForEveryone')}
+                          <button
+                            style={{ background: 'transparent', border: 'none', color: 'var(--wa-danger)', fontSize: '12px', padding: '5px 8px', cursor: 'pointer', borderRadius: '6px' }}
+                            onClick={(e) => { e.stopPropagation(); handleDeleteMessage(msg.id, 'deleteForEveryone'); }}
                           >
-                            🚨 Delete for Everyone
+                            🚨 Everyone
                           </button>
                         )}
+                      </div>
+                    )}
+
+                    {/* ── Reply Quote Preview ── */}
+                    {msg.replyToId && msg.replyToText && (
+                      <div style={{
+                        borderLeft: '3px solid var(--wa-primary)',
+                        background: isMine ? 'rgba(0,0,0,0.2)' : 'rgba(255,255,255,0.07)',
+                        borderRadius: '6px',
+                        padding: '5px 8px',
+                        marginBottom: '4px',
+                        fontSize: '12px',
+                        cursor: 'pointer',
+                        maxWidth: '100%',
+                        overflow: 'hidden',
+                      }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          // Scroll to original message
+                          const el = document.getElementById(`msg-${msg.replyToId}`);
+                          if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.classList.add('highlight-flash'); setTimeout(() => el.classList.remove('highlight-flash'), 1000); }
+                        }}
+                      >
+                        <div style={{ color: 'var(--wa-primary)', fontWeight: 600, marginBottom: '2px', fontSize: '11px' }}>
+                          {msg.replyToSender || 'Message'}
+                        </div>
+                        <div style={{ color: 'var(--wa-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '240px' }}>
+                          {msg.replyToText}
+                        </div>
                       </div>
                     )}
 
@@ -1144,7 +1255,7 @@ export default function SZChatApp() {
                       )}
                       <span>{formatTime(msg.timestamp)}</span>
                       {isMine && (
-                        <span className={`tick-mark ${msg.status === 'read' ? 'blue' : 'gray'}`}>
+                        <span className={`tick-mark ${msg.status === 'read' ? 'blue' : 'gray'} ${msg.isOptimistic ? 'optimistic-tick' : ''}`}>
                           {msg.status === 'sent' ? (
                             <svg viewBox="0 0 16 16"><path d="M15.01 3.3L6.41 11.9 1.4 6.89l1.41-1.41 3.6 3.6 7.19-7.19z"/></svg>
                           ) : (
@@ -1227,16 +1338,38 @@ export default function SZChatApp() {
                     📸
                   </button>
 
-                  <input 
-                    type="text" 
-                    className="input-box" 
-                    placeholder="Encrypted message..." 
+                  {/* Reply bar above input — shows when replying */}
+                  {replyTo && (
+                    <div style={{
+                      display: 'flex', alignItems: 'center', gap: '8px',
+                      padding: '8px 12px',
+                      background: 'var(--wa-input-dark)',
+                      borderTop: '1px solid var(--wa-border-dark)',
+                      borderRadius: '8px 8px 0 0',
+                      marginBottom: '-1px',
+                    }}>
+                      <div style={{ borderLeft: '3px solid var(--wa-primary)', paddingLeft: '8px', flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--wa-primary)' }}>{replyTo.senderName}</div>
+                        <div style={{ fontSize: '12px', color: 'var(--wa-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{replyTo.text}</div>
+                      </div>
+                      <button
+                        onClick={() => setReplyTo(null)}
+                        style={{ background: 'transparent', border: 'none', color: 'var(--wa-text-muted)', fontSize: '18px', cursor: 'pointer', lineHeight: 1, flexShrink: 0 }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )}
+
+                  <input
+                    type="text"
+                    ref={inputRef}
+                    className="input-box"
+                    placeholder="Encrypted message..."
                     value={inputText}
                     onChange={e => handleInputChange(e.target.value)}
                     onKeyDown={e => {
-                      if (e.key === 'Enter') {
-                        handleSendMessage();
-                      }
+                      if (e.key === 'Enter') handleSendMessage();
                     }}
                   />
 

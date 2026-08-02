@@ -86,6 +86,10 @@ const MessageSchema = new mongoose.Schema({
   disappearingOption: { type: String, default: 'off' },
   expiresAt: { type: Number },
   deletedFor: [{ type: String }],
+  // Reply fields
+  replyToId: { type: String },
+  replyToText: { type: String },
+  replyToSender: { type: String },
 });
 
 // Index for fast conversation lookups
