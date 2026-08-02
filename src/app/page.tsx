@@ -116,6 +116,8 @@ export default function SZChatApp() {
   // Refs for State Diffing & Scroll Lock
   const contactsRef = useRef<UserProfile[]>([]);
   const messagesRef = useRef<MessageItem[]>([]);
+  const activeContactRef = useRef<UserProfile | null>(null);
+  const currentUserRef = useRef<UserProfile | null>(null);
   // Track which message IDs have already been decrypted (avoid re-decrypting)
   const decryptedIdsRef = useRef<Set<string>>(new Set());
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -128,6 +130,8 @@ export default function SZChatApp() {
   // Keep refs in sync with state for diffing
   useEffect(() => { contactsRef.current = contacts; }, [contacts]);
   useEffect(() => { messagesRef.current = messages; }, [messages]);
+  useEffect(() => { activeContactRef.current = activeContact; }, [activeContact]);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
 
   // 1. Restore Session & Hydration Check
   useEffect(() => {
@@ -307,7 +311,7 @@ export default function SZChatApp() {
 
         if (msg.ciphertext && msg.iv) {
           try {
-            const aesKey = await getSymmetricKeyForPair(currentUser?.id || '', msg.senderId);
+            const aesKey = await getSymmetricKeyForPair(currentUserRef.current?.id || '', msg.senderId);
             plainText = await decryptE2EE(aesKey, msg.ciphertext, msg.iv);
           } catch {
             plainText = '[Encrypted Message]';
@@ -325,9 +329,10 @@ export default function SZChatApp() {
 
         // Save incoming message to state & localStorage
         setMessages(prev => {
-          const isMsgForActiveChat = activeContact && activeContact.id === msg.senderId;
+          const activeContactId = activeContactRef.current?.id;
+          const isMsgForActiveChat = activeContactId && activeContactId === msg.senderId;
           const targetContactId = msg.senderId;
-          const localKey = `szchat_msgs_${currentUser?.id}_${targetContactId}`;
+          const localKey = `szchat_msgs_${currentUserRef.current?.id}_${targetContactId}`;
 
           let updated: MessageItem[] = [];
           const saved = localStorage.getItem(localKey);
@@ -356,14 +361,14 @@ export default function SZChatApp() {
     });
 
     conn.on('close', () => {
-      if (activeContact && conn.peer === activeContact.id) {
+      if (activeContactRef.current && conn.peer === activeContactRef.current.id) {
         setPeerStatus('offline');
       }
       delete connectionsRef.current[conn.peer];
     });
 
     conn.on('error', () => {
-      if (activeContact && conn.peer === activeContact.id) {
+      if (activeContactRef.current && conn.peer === activeContactRef.current.id) {
         setPeerStatus('offline');
       }
       delete connectionsRef.current[conn.peer];
@@ -393,7 +398,13 @@ export default function SZChatApp() {
 
       peerInstance.on('connection', (conn: any) => {
         connectionsRef.current[conn.peer] = conn;
-        setupConnectionListeners(conn);
+        if (conn.open) {
+          setupConnectionListeners(conn);
+        } else {
+          conn.on('open', () => {
+            setupConnectionListeners(conn);
+          });
+        }
       });
     });
 
